@@ -142,17 +142,16 @@ class StreamingProcessor:
             try:
                 turn_ids = torch.cat(self.turn_buffer, dim=1)
                 self.user_hist.append(turn_ids)
-                user_ctx = self._context(self.user_hist, 24)  # longer context for turn-based
+                user_ctx = self._context(self.user_hist, 32)  # longer context for turn-based
                 with torch.no_grad():
-                    # Increase max_new_tokens to produce longer audio
+                    # Increase max_new_tokens to produce longer audio (~2.5-3.5s)
                     new_ids = self.model.generate_streaming(
-                        user_ctx, max_new_tokens=48, temperature=0.9
+                        user_ctx, max_new_tokens=128, temperature=0.9
                     )
                     self.ai_hist.append(new_ids)
                     out_audio = self.tok.detokenize(new_ids)
                 latency_ms = (time.time() - t0) * 1000.0
                 self.lat_hist.append(latency_ms)
-                # Log output duration estimate (assuming tokenizer's mel hop ~80ms per token in this demo)
                 try:
                     samples = out_audio.numel() if out_audio.dim()==1 else out_audio.view(-1).numel()
                     print(f"[AI] Generated tokens≈{new_ids.numel()} → samples={samples}")
