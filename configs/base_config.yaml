@@ -1,0 +1,16 @@
+model:
+  vocab_size: 32000
+  speech_vocab_size: 1024
+  hidden_size: 768
+  num_hidden_layers: 12
+  num_attention_heads: 12
+  intermediate_size: 3072
+  max_seq_len: 2048
+  chunk_size_ms: 80
+  use_dual_stream: true
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  vad_threshold: 0.01
+  sample_rate: 24000
