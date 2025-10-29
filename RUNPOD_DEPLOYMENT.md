@@ -12,15 +12,13 @@ This guide shows exactly how to launch and test the realtime Speech-to-Speech se
 - Expose Port: 8000 TCP
 
 ### Environment Variables (set in Pod UI)
-- `HF_HOME=/workspace/cache/huggingface`
+- `MODEL_CACHE_DIR=/workspace/cache/models`
 - `TORCH_HOME=/workspace/cache/torch`
 - `PYTHONPATH=/workspace/Testing-S2S`
 - `CUDA_VISIBLE_DEVICES=0`
+- `REPLY_MODE=stream` (or `turn` for turn-based mode)
 
-Optional:
-- `HF_TOKEN=<your_hf_token>` if you need private HF models. Not required for this repo to run the MVP.
-
-> Note: If you intend to pull private models from Hugging Face, set `HF_TOKEN` here or run `huggingface-cli login` inside the pod. For public models and our current code, HF_TOKEN is not mandatory.
+> **No HF_TOKEN Required**: The public HiFiGAN vocoder downloads directly from GitHub releases without authentication.
 
 ---
 
@@ -34,11 +32,8 @@ apt install -y git curl wget build-essential pkg-config \
     portaudio19-dev libasound2-dev \
     python3-dev python3-pip python3-venv
 
-# (Optional) Rust for some audio libs
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-. ~/.cargo/env
-
-mkdir -p /workspace/cache/huggingface /workspace/cache/torch /workspace/models /workspace/data
+# Create cache directories
+mkdir -p /workspace/cache/models /workspace/cache/torch /workspace/data
 cd /workspace
 
 # 2) Clone repository
@@ -75,63 +70,145 @@ PY
 
 ## Start the Realtime Server
 
+### Stream Mode (Continuous Response)
 ```bash
 # Activate venv if not active
 . /workspace/Testing-S2S/venv/bin/activate
 
-# Start FastAPI/WS server on port 8000
+# Start server in streaming mode
 python src/server.py
 ```
 
-- Health check: `http://<your-pod-id>.direct.runpod.net:8000/health`
-- Latency stats: `http://<your-pod-id>.direct.runpod.net:8000/api/stats`
-- WebSocket stream: `wss://<your-pod-id>.direct.runpod.net:8000/ws/stream`
-
-> Microphone access in browsers requires HTTPS. RunPod exposes HTTPS automatically on direct.runpod.net.
-
----
-
-## Minimal Web UI (Test Page)
-
-You can host a simple static HTML page from the pod using `python -m http.server`, but the simplest is to open this local file using your browser with the correct WS URL.
-
-Create a file `webui/index.html` with the content from this repo (examples/minimal_websocket_client.html) and open it locally, or use a static server in the pod:
-
+### Turn-Based Mode (VAD Turn Detection)
 ```bash
-# From repo root
-python -m http.server 8080 --bind 0.0.0.0
-# Then open: http://<your-pod-id>.direct.runpod.net:8080/webui/index.html
+# Activate venv if not active
+. /workspace/Testing-S2S/venv/bin/activate
+
+# Start server in turn-based mode
+REPLY_MODE=turn python src/server.py
 ```
 
-Make sure the WS URL in the page points to:
-`wss://<your-pod-id>.direct.runpod.net:8000/ws/stream`
+## API Endpoints
+
+- Health check: `https://<your-pod-id>.direct.runpod.net:8000/health`
+- Latency stats: `https://<your-pod-id>.direct.runpod.net:8000/api/stats`
+- WebSocket stream: `wss://<your-pod-id>.direct.runpod.net:8000/ws/stream`
+- Web UI: `https://<your-pod-id>.direct.runpod.net:8000/`
+
+> **HTTPS Required**: Microphone access in browsers requires HTTPS. RunPod exposes HTTPS automatically on direct.runpod.net.
 
 ---
 
-## Do I need HF_TOKEN?
+## HiFiGAN Vocoder Setup
 
-- For this MVP: Not required.
-- If you pull private Hugging Face models or gated repos: set `HF_TOKEN` in the Pod env or run `huggingface-cli login` in the terminal.
-- Cache paths are already set using `HF_HOME`.
+**Automatic Download**: The public HiFiGAN vocoder (~55MB) downloads automatically on first run:
+- No authentication required
+- Downloads from GitHub releases
+- MIT License (commercial use allowed)
+- Cached in `/workspace/cache/models/hifigan_public/`
+
+**First Run Output**:
+```
+[INFO] Downloading public HiFiGAN generator from GitHub releases...
+[INFO] Downloaded 100.0%
+[INFO] generator download complete: /workspace/cache/models/hifigan_public/generator.pth
+[INFO] HiFiGAN generator loaded successfully
+```
+
+---
+
+## Mode Comparison
+
+### Stream Mode (Default)
+- **REPLY_MODE=stream**
+- Continuous response generation
+- Lower perceived latency (~400ms)
+- Real-time interaction
+- Best for: Interactive applications, voice assistants
+
+### Turn-Based Mode 
+- **REPLY_MODE=turn**
+- Waits for user to finish speaking
+- Generates longer, more coherent responses
+- VAD-based turn detection (30 frames of silence)
+- Best for: Conversations, interviews, presentations
+
+**Turn Mode Debug Output**:
+```
+[DEBUG] Turn ended, generating response from 15 chunks
+[DEBUG] Response generated, latency: 450.2ms
+[INFO] StreamingProcessor reset (mode: turn)
+```
+
+---
+
+## Performance Monitoring
 
 ```bash
-# Optional: authenticate to Hugging Face
-pip install --upgrade huggingface_hub
-huggingface-cli login --token $HF_TOKEN
+# Check latency stats
+curl https://<your-pod-id>.direct.runpod.net:8000/api/stats
+
+# Expected response:
+{
+  "latency_ms": {
+    "mean": 412.5,
+    "min": 285.1,
+    "max": 650.3,
+    "p95": 580.2,
+    "mode": "turn",
+    "turn_buffer_size": 0
+  }
+}
+```
+
+---
+
+## Testing Commands
+
+```bash
+# Pull latest changes
+cd /workspace/Testing-S2S
+git pull
+
+# Test turn-based mode
+REPLY_MODE=turn python src/server.py
+
+# Test stream mode (default)
+python src/server.py
+
+# Check model cache
+ls -la /workspace/cache/models/hifigan_public/
+
+# Clear cache if needed
+rm -rf /workspace/cache/models/hifigan_public/
 ```
 
 ---
 
 ## Troubleshooting
 
-- Microphone blocked: Ensure you access via HTTPS (RunPod direct URL is HTTPS). Some browsers require user interaction before mic can be used.
-- CUDA OOM: Reduce batch sizes or model sizes; restart server.
-- No audio output: Check that the browser sample rate is 24kHz mono, and that your UI sends 80ms PCM chunks.
-- Port closed: Verify 8000/TCP is exposed in Pod settings.
+### Vocoder Issues
+- **Download failed**: Check internet connection, GitHub access
+- **Load failed**: Check disk space in `/workspace/cache/`
+- **Quality degraded**: Re-download by clearing cache directory
+
+### Turn Mode Issues
+- **No response**: Check VAD threshold, ensure sufficient silence
+- **Response too fast**: Increase `silence_frames` in StreamingProcessor
+- **Response too slow**: Decrease VAD threshold or silence detection
+
+### General Issues
+- **Microphone blocked**: Ensure HTTPS access via RunPod direct URL
+- **CUDA OOM**: Reduce batch sizes or use smaller models
+- **No audio output**: Verify 24kHz mono PCM format
+- **Port closed**: Verify 8000/TCP is exposed in Pod settings
 
 ---
 
 ## Next Steps
-- Add a small HTML/JS Web UI (provided in `examples/minimal_websocket_client.html`).
-- Integrate WebRTC for echo cancellation + automatic device selection.
-- Add dataset loaders and training scripts for Indian/SEA language adaptation.
+- WebRTC integration for echo cancellation
+- Custom voice adaptation training
+- Multi-language support
+- Production-grade deployment
+
+See [`VOCODER_NOTICE.md`](VOCODER_NOTICE.md) for complete HiFiGAN license details.
