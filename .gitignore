@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.cache/
+/workspace/cache/
+/workspace/models/
+.DS_Store
+*.wav
