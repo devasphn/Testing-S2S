@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Update tokenizer to use neural vocoder if available (HiFiGAN via torchaudio).
-Falls back to Griffin-Lim when vocoder not present.
+GLM-4-Voice style ultra-low bitrate speech tokenizer (HiFiGAN enforced)
+- Fails with error if HiFiGAN is not available
+- Uses only neural vocoder for mel_to_audio
 """
 from typing import Tuple
 import torch
@@ -9,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import librosa
-
 from .vocoder import Vocoder
 
 class SpeechTokenizer(nn.Module):
@@ -51,19 +51,10 @@ class SpeechTokenizer(nn.Module):
         return mel
 
     def mel_to_audio(self, mel: torch.Tensor) -> torch.Tensor:
-        # Try neural vocoder first
         wav = self.vocoder.infer(mel)
-        if wav.numel() > 0:
-            return wav
-        # Fallback: Griffin-Lim
-        audios = []
-        for i in range(mel.size(0)):
-            m = mel[i].detach().cpu().numpy()
-            m = m * 80.0 - 80.0
-            p = librosa.db_to_power(m)
-            a = librosa.feature.inverse.mel_to_audio(p, sr=self.sr, hop_length=self.hop, n_fft=1024)
-            audios.append(torch.tensor(a, dtype=torch.float32))
-        return torch.stack(audios).to(mel.device)
+        if wav.numel() == 0:
+            raise RuntimeError("[ERROR] HiFiGAN vocoder is required and was not found. Please install torchaudio >=2.2.0 with CUDA support.")
+        return wav
 
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
         mel = self.audio_to_mel(audio)
