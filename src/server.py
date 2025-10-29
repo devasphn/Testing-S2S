@@ -16,15 +16,14 @@ from src.models.streaming_processor import StreamingProcessor
 from src.api_config import router as api_router
 from src.web_route import router as web_router
 
-# Strict determinism and safer backends
+# Safer backends (avoid deterministic crash); keep cuDNN deterministic only
 try:
-    torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 except Exception:
     pass
 
-app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.4")
+app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,7 +91,7 @@ async def startup():
         chunk_size_ms=80,
         sample_rate=TRANSPORT_SR,
         max_latency_ms=200,
-        vad_threshold=0.01,
+        vad_threshold=0.001,  # lower threshold to detect speech more easily
     )
     # Warmup once to reduce first-turn latency/plan selection
     await _warmup_pipeline()
