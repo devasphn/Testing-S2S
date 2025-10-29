@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+GLM-4-Voice style ultra-low bitrate speech tokenizer (MVP)
+- 12.5 Hz framing simulated via hop length at 24kHz (~80ms)
+- Single codebook vector quantization
+- Griffin-Lim placeholder vocoder (replace with HiFiGAN later)
+"""
+from typing import Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import librosa
+
+
+class SpeechTokenizer(nn.Module):
+    def __init__(self, n_mels: int = 80, sample_rate: int = 24000, hop_ms: int = 80, codebook_size: int = 1024, hidden: int = 256):
+        super().__init__()
+        self.n_mels = n_mels
+        self.sr = sample_rate
+        self.hop = int(sample_rate * hop_ms / 1000)
+        self.codebook_size = codebook_size
+        self.hidden = hidden
+
+        self.enc = nn.Sequential(
+            nn.Conv1d(n_mels, hidden, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden, hidden, 3, padding=1),
+            nn.ReLU(),
+        )
+        self.enc_tf = nn.TransformerEncoderLayer(d_model=hidden, nhead=4, dim_feedforward=hidden*2, batch_first=True)
+        self.dec_tf = nn.TransformerDecoderLayer(d_model=hidden, nhead=4, dim_feedforward=hidden*2, batch_first=True)
+        self.dec = nn.Sequential(
+            nn.ConvTranspose1d(hidden, hidden, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(hidden, n_mels, 3, padding=1),
+        )
+        self.codebook = nn.Parameter(torch.randn(codebook_size, hidden) * 0.02)
+
+    def audio_to_mel(self, audio: torch.Tensor) -> torch.Tensor:
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        mels = []
+        for i in range(audio.size(0)):
+            a = audio[i].detach().cpu().numpy()
+            mel = librosa.feature.melspectrogram(y=a, sr=self.sr, n_mels=self.n_mels, hop_length=self.hop, n_fft=1024)
+            mel = librosa.power_to_db(mel, ref=np.max)
+            mel = (mel + 80.0) / 80.0
+            mels.append(torch.tensor(mel, dtype=torch.float32))
+        mel = torch.stack(mels).to(audio.device)  # [B, n_mels, T]
+        return mel
+
+    def mel_to_audio(self, mel: torch.Tensor) -> torch.Tensor:
+        audios = []
+        for i in range(mel.size(0)):
+            m = mel[i].detach().cpu().numpy()
+            m = m * 80.0 - 80.0
+            p = librosa.db_to_power(m)
+            a = librosa.feature.inverse.mel_to_audio(p, sr=self.sr, hop_length=self.hop, n_fft=1024)
+            audios.append(torch.tensor(a, dtype=torch.float32))
+        return torch.stack(audios).to(mel.device)
+
+    def encode(self, audio: torch.Tensor) -> torch.Tensor:
+        mel = self.audio_to_mel(audio)                # [B, M, T]
+        h = self.enc(mel)                             # [B, H, T]
+        h = h.transpose(1, 2)                         # [B, T, H]
+        h = self.enc_tf(h)                            # [B, T, H]
+        return h
+
+    def quantize(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, t, d = h.shape
+        flat = h.reshape(-1, d)
+        # L2 distances to codebook
+        dists = (flat.unsqueeze(1) - self.codebook.unsqueeze(0)).pow(2).sum(-1)
+        idx = torch.argmin(dists, dim=1)
+        q = self.codebook[idx].reshape(b, t, d)
+        q = h + (q - h).detach()  # straight-through
+        return q, idx.reshape(b, t)
+
+    def decode(self, q: torch.Tensor) -> torch.Tensor:
+        x = self.dec_tf(q, q)         # simple self-decoder
+        x = x.transpose(1, 2)         # [B, H, T]
+        mel = self.dec(x)             # [B, M, T]
+        return mel
+
+    def tokenize(self, audio: torch.Tensor) -> torch.Tensor:
+        h = self.encode(audio)
+        _, idx = self.quantize(h)
+        return idx
+
+    def detokenize(self, idx: torch.Tensor) -> torch.Tensor:
+        q = self.codebook[idx]
+        mel = self.decode(q)
+        audio = self.mel_to_audio(mel)
+        return audio
