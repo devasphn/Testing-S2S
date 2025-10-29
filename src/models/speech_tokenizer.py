@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-GLM-4-Voice style ultra-low bitrate speech tokenizer (MVP)
-- 12.5 Hz framing simulated via hop length at 24kHz (~80ms)
-- Single codebook vector quantization
-- Griffin-Lim placeholder vocoder (replace with HiFiGAN later)
+Update tokenizer to use neural vocoder if available (HiFiGAN via torchaudio).
+Falls back to Griffin-Lim when vocoder not present.
 """
 from typing import Tuple
 import torch
@@ -12,6 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 import librosa
 
+from .vocoder import Vocoder
 
 class SpeechTokenizer(nn.Module):
     def __init__(self, n_mels: int = 80, sample_rate: int = 24000, hop_ms: int = 80, codebook_size: int = 1024, hidden: int = 256):
@@ -36,6 +35,7 @@ class SpeechTokenizer(nn.Module):
             nn.ConvTranspose1d(hidden, n_mels, 3, padding=1),
         )
         self.codebook = nn.Parameter(torch.randn(codebook_size, hidden) * 0.02)
+        self.vocoder = Vocoder()
 
     def audio_to_mel(self, audio: torch.Tensor) -> torch.Tensor:
         if audio.dim() == 1:
@@ -51,6 +51,11 @@ class SpeechTokenizer(nn.Module):
         return mel
 
     def mel_to_audio(self, mel: torch.Tensor) -> torch.Tensor:
+        # Try neural vocoder first
+        wav = self.vocoder.infer(mel)
+        if wav.numel() > 0:
+            return wav
+        # Fallback: Griffin-Lim
         audios = []
         for i in range(mel.size(0)):
             m = mel[i].detach().cpu().numpy()
@@ -61,26 +66,25 @@ class SpeechTokenizer(nn.Module):
         return torch.stack(audios).to(mel.device)
 
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
-        mel = self.audio_to_mel(audio)                # [B, M, T]
-        h = self.enc(mel)                             # [B, H, T]
-        h = h.transpose(1, 2)                         # [B, T, H]
-        h = self.enc_tf(h)                            # [B, T, H]
+        mel = self.audio_to_mel(audio)
+        h = self.enc(mel)
+        h = h.transpose(1, 2)
+        h = self.enc_tf(h)
         return h
 
     def quantize(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, d = h.shape
         flat = h.reshape(-1, d)
-        # L2 distances to codebook
         dists = (flat.unsqueeze(1) - self.codebook.unsqueeze(0)).pow(2).sum(-1)
         idx = torch.argmin(dists, dim=1)
         q = self.codebook[idx].reshape(b, t, d)
-        q = h + (q - h).detach()  # straight-through
+        q = h + (q - h).detach()
         return q, idx.reshape(b, t)
 
     def decode(self, q: torch.Tensor) -> torch.Tensor:
-        x = self.dec_tf(q, q)         # simple self-decoder
-        x = x.transpose(1, 2)         # [B, H, T]
-        mel = self.dec(x)             # [B, M, T]
+        x = self.dec_tf(q, q)
+        x = x.transpose(1, 2)
+        mel = self.dec(x)
         return mel
 
     def tokenize(self, audio: torch.Tensor) -> torch.Tensor:
