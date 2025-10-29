@@ -15,6 +15,13 @@ from src.models.streaming_processor import StreamingProcessor
 from src.api_config import router as api_router
 from src.web_route import router as web_router
 
+# cuDNN safety to avoid bad plan selection warnings / instability
+try:
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = True
+except Exception:
+    pass
+
 app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.0")
 
 app.add_middleware(
@@ -33,6 +40,26 @@ _tok: Optional[SpeechTokenizer] = None
 _proc: Optional[StreamingProcessor] = None
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Resampling helper (22.05 kHz -> 24 kHz) for client playback compatibility
+import math
+
+def _resample_if_needed(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
+    if src_sr == dst_sr:
+        return wav
+    # Use linear interpolation for low-latency resample
+    wav = wav.detach().cpu()
+    n = wav.numel()
+    dur = n / float(src_sr)
+    m = int(round(dur * dst_sr))
+    if m <= 1 or n <= 1:
+        return torch.zeros(m, dtype=wav.dtype)
+    x = torch.linspace(0, n - 1, steps=m)
+    x0 = torch.clamp(x.floor().long(), 0, n - 2)
+    x1 = x0 + 1
+    frac = (x - x0.float())
+    y = wav[x0] * (1.0 - frac) + wav[x1] * frac
+    return y
+
 @app.on_event("startup")
 async def startup():
     global _model, _tok, _proc
@@ -42,7 +69,7 @@ async def startup():
         model=_model,
         speech_tokenizer=_tok,
         chunk_size_ms=80,
-        sample_rate=24000,
+        sample_rate=24000,  # Transport/sample framing for client
         max_latency_ms=200,
         vad_threshold=0.01,
     )
@@ -65,7 +92,19 @@ async def ws_stream(ws: WebSocket):
             audio = torch.from_numpy(audio_i16.astype(np.float32) / 32768.0).to(_device)
             out = await _proc.process_audio_stream(audio)
             if out is not None:
-                out_np = (out.detach().cpu().numpy() * 32768.0).astype(np.int16).tobytes()
+                # Ensure 1D float waveform
+                if out.dim() > 1:
+                    out = out.view(-1)
+                # Replace NaNs/Infs, clamp to [-1, 1]
+                out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+                out = torch.clamp(out, -1.0, 1.0)
+                # Resample (HiFiGAN 22050 -> client 24000) if tokenizer exposes sr
+                src_sr = getattr(_tok.vocoder, 'sample_rate', 24000) if _tok else 24000
+                out_cpu = out.detach().cpu()
+                if src_sr != 24000:
+                    out_cpu = _resample_if_needed(out_cpu, src_sr, 24000)
+                # Scale to int16 safely
+                out_np = (out_cpu.numpy() * 32767.0).astype(np.int16).tobytes()
                 await ws.send_bytes(out_np)
     except WebSocketDisconnect:
         pass
