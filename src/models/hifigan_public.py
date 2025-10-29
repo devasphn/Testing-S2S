@@ -87,9 +87,10 @@ class PublicHiFiGANVocoder(nn.Module):
                     audio = self.denoiser(audio, denoising_strength)
                 except Exception:
                     pass
+            # Scale safely
             max_wav_value = self.vocoder_config.get('max_wav_value', 1.0) if isinstance(self.vocoder_config, dict) else 1.0
             if max_wav_value != 1.0:
-                audio = audio * max_wav_value
+                audio = audio / max_wav_value  # normalize to [-1,1] domain expected by server limiter
             return audio.detach().cpu()
         finally:
             torch.backends.cudnn.enabled = prev
