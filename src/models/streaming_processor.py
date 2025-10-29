@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Moshi-style streaming processor with energy-based VAD and 80ms chunking
-Fix: ensure all tensors (buffers, chunks) are on model device to avoid CPU/CUDA concat errors.
+Streaming Processor - Performance tweaks
+- Ensure device consistency
+- Reduce max_new_tokens per step
+- Batch detokenize if needed (MVP keeps single stream)
+- Avoid excessive history growth
 """
 from collections import deque
 from typing import Optional, Dict, List
@@ -42,7 +45,8 @@ class Chunker:
             audio = audio.to(self.device)
         self.buf = torch.cat([self.buf, audio])
         out = []
-        while len(self.buf) >= self.size:
+        # produce at most 1 chunk per call to keep latency low
+        if len(self.buf) >= self.size:
             out.append(self.buf[: self.size].clone())
             self.buf = self.buf[self.size - self.overlap :]
         return out
@@ -62,15 +66,14 @@ class StreamingProcessor:
         self.device = next(model.parameters()).device
         self.chunker = Chunker(chunk_ms=chunk_size_ms, sr=sample_rate, device=self.device)
         self.vad = VAD(threshold=vad_threshold)
-        self.user_hist = deque(maxlen=16)
-        self.ai_hist = deque(maxlen=16)
-        self.lat_hist = deque(maxlen=100)
+        self.user_hist = deque(maxlen=8)   # smaller history
+        self.ai_hist = deque(maxlen=8)
+        self.lat_hist = deque(maxlen=200)
 
     async def process_audio_stream(self, audio: torch.Tensor) -> Optional[torch.Tensor]:
         t0 = time.time()
         if audio.dim() > 1:
             audio = audio.view(-1)
-        # ensure device consistency
         audio = audio.to(self.device)
         self.chunker.to(self.device)
 
@@ -79,12 +82,12 @@ class StreamingProcessor:
             if not self.vad(ch):
                 continue
             with torch.no_grad():
-                ids = self.tok.tokenize(ch.unsqueeze(0).to(self.device))  # [1,T]
+                ids = self.tok.tokenize(ch.unsqueeze(0).to(self.device))
             self.user_hist.append(ids)
-            user_ctx = self._context(self.user_hist, 12)
-            ai_ctx = self._context(self.ai_hist, 12)
+            user_ctx = self._context(self.user_hist, 8)
+            # generate fewer tokens per step for lower latency
             with torch.no_grad():
-                new_ids = self.model.generate_streaming(user_ctx, max_new_tokens=8)
+                new_ids = self.model.generate_streaming(user_ctx, max_new_tokens=4, temperature=0.95)
                 self.ai_hist.append(new_ids)
                 out_audio = self.tok.detokenize(new_ids)
             self.lat_hist.append((time.time() - t0) * 1000.0)
