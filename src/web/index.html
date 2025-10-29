@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Testing-S2S /web</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    #status { margin: 8px 0; }
+    .row { margin: 10px 0; }
+    input[type=text] { width: 600px; }
+  </style>
+</head>
+<body>
+  <h1>Testing-S2S Live</h1>
+  <div id="status">Idle</div>
+  <div class="row">
+    <label>WS URL:</label>
+    <input id="wsUrl" type="text" value="wss://YOUR-POD.direct.runpod.net:8000/ws/stream" />
+  </div>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <pre id="logs" style="height:200px;overflow:auto;background:#f5f5f5;padding:12px;"></pre>
+
+<script>
+const statusEl = document.getElementById('status');
+const logsEl = document.getElementById('logs');
+const wsUrlEl = document.getElementById('wsUrl');
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+let ws=null, media=null, ctx=null, proc=null;
+
+function log(m){ logsEl.textContent += m+"\n"; logsEl.scrollTop = logsEl.scrollHeight; }
+function f32_to_i16(f){
+  const b = new ArrayBuffer(f.length*2); const v = new DataView(b); let o=0;
+  for(let i=0;i<f.length;i++,o+=2){ let s=Math.max(-1,Math.min(1,f[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true);} return b;
+}
+
+async function start(){
+  const url = wsUrlEl.value.trim(); if(!url){ alert('Enter WS URL'); return; }
+  ws = new WebSocket(url); ws.binaryType = 'arraybuffer';
+  ws.onopen = ()=>{ log('WS open'); statusEl.textContent='Connected'; };
+  ws.onclose= ()=>{ log('WS close'); statusEl.textContent='Closed'; };
+  ws.onerror= e=>{ log('WS error'); };
+  ws.onmessage = ev=>{ if(!(ev.data instanceof ArrayBuffer)) return; const i16=new Int16Array(ev.data); const f=new Float32Array(i16.length); for(let i=0;i<i16.length;i++) f[i]=i16[i]/32768.0; const b=ctx.createBuffer(1,f.length,24000); b.getChannelData(0).set(f); const src=ctx.createBufferSource(); src.buffer=b; src.connect(ctx.destination); src.start(); };
+
+  media = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,sampleRate:24000, echoCancellation:true, noiseSuppression:true}});
+  ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
+  const src = ctx.createMediaStreamSource(media);
+  proc = ctx.createScriptProcessor(2048,1,1);
+  proc.onaudioprocess = e=>{ if(!ws||ws.readyState!==1) return; const ch=e.inputBuffer.getChannelData(0); const size=1920; for(let i=0;i<ch.length;i+=size){ const sl=ch.subarray(i, Math.min(i+size, ch.length)); ws.send(f32_to_i16(sl)); } };
+  src.connect(proc); proc.connect(ctx.destination);
+  startBtn.disabled=true; stopBtn.disabled=false;
+}
+function stop(){ if(proc){proc.disconnect(); proc=null;} if(ctx){ctx.close(); ctx=null;} if(media){media.getTracks().forEach(t=>t.stop()); media=null;} if(ws){ws.close(); ws=null;} startBtn.disabled=false; stopBtn.disabled=true; statusEl.textContent='Idle'; }
+startBtn.onclick=start; stopBtn.onclick=stop;
+</script>
+</body>
+</html>
