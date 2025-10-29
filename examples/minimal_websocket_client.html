@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Testing-S2S Realtime Demo</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    #status { margin: 10px 0; }
+    textarea { width: 100%; height: 100px; }
+  </style>
+</head>
+<body>
+  <h1>Testing-S2S Realtime Demo</h1>
+  <div id="status">Idle</div>
+  <label>Server WS URL:</label>
+  <input id="wsUrl" size="80" value="wss://YOUR-POD.direct.runpod.net:8000/ws/stream" />
+  <div>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <h3>Logs</h3>
+  <textarea id="logs" readonly></textarea>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const logsEl = document.getElementById('logs');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const wsUrlEl = document.getElementById('wsUrl');
+
+    let ws = null;
+    let mediaStream = null;
+    let audioContext = null;
+    let processor = null;
+
+    function log(msg) {
+      logsEl.value += msg + "\n";
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    function floatTo16BitPCM(input) {
+      const buffer = new ArrayBuffer(input.length * 2);
+      const view = new DataView(buffer);
+      let offset = 0;
+      for (let i = 0; i < input.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buffer;
+    }
+
+    async function start() {
+      const wsUrl = wsUrlEl.value.trim();
+      if (!wsUrl) { alert('Enter WS URL'); return; }
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => { log('WS connected'); statusEl.textContent = 'Connected'; };
+        ws.onclose = () => { log('WS closed'); statusEl.textContent = 'Closed'; };
+        ws.onerror = (e) => { log('WS error: ' + e); };
+
+        ws.onmessage = (event) => {
+          // Received 16-bit PCM mono @ 24kHz, play it
+          const arrayBuf = event.data;
+          if (!(arrayBuf instanceof ArrayBuffer)) return;
+          const int16 = new Int16Array(arrayBuf);
+          const float32 = new Float32Array(int16.length);
+          for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0;
+          }
+          const audioBuf = audioContext.createBuffer(1, float32.length, 24000);
+          audioBuf.getChannelData(0).set(float32);
+          const src = audioContext.createBufferSource();
+          src.buffer = audioBuf;
+          src.connect(audioContext.destination);
+          src.start();
+        };
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({audio: {
+          channelCount: 1,
+          sampleRate: 24000,
+          echoCancellation: true,
+          noiseSuppression: true
+        }});
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(2048, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0);
+          // Send ~80ms chunks (at 24kHz => 1920 samples)
+          const chunkSize = 1920;
+          for (let i = 0; i < input.length; i += chunkSize) {
+            const slice = input.subarray(i, Math.min(i + chunkSize, input.length));
+            const buf = floatTo16BitPCM(slice);
+            ws.send(buf);
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } catch (err) {
+        log('Error: ' + err);
+      }
+    }
+
+    function stop() {
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      statusEl.textContent = 'Idle';
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>
