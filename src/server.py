@@ -16,15 +16,15 @@ from src.models.streaming_processor import StreamingProcessor
 from src.api_config import router as api_router
 from src.web_route import router as web_router
 
-# cuDNN safety
+# Strict determinism and safer backends
 try:
+    torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = True
     torch.backends.cudnn.deterministic = True
 except Exception:
     pass
 
-app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.2")
+app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,9 +44,11 @@ _device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Transport format
 TRANSPORT_SR = 24000
-FRAME_MS = 40
+FRAME_MS = 20  # 20ms frames (480 samples @ 24k)
 FRAME_SAMPLES = int(TRANSPORT_SR * FRAME_MS / 1000)
+FRAME_PACING_SEC = FRAME_MS / 1000.0
 
+# Resampling helper (22.05 kHz -> 24 kHz)
 def _resample_linear(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
     if src_sr == dst_sr:
         return wav
@@ -64,8 +66,20 @@ def _resample_linear(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tenso
     y = wav[x0] * (1.0 - frac) + wav[x1] * frac
     return y
 
+# Soft limiter to avoid clipping
 def _limit(x: torch.Tensor, thresh: float = 0.98) -> torch.Tensor:
     return torch.tanh(x / thresh) * thresh
+
+async def _warmup_pipeline():
+    """Run a tiny warmup through tokenizer/model to prebuild kernels."""
+    global _proc
+    if _proc is None:
+        return
+    fake = torch.zeros(int(TRANSPORT_SR * 0.08), dtype=torch.float32, device=_device)
+    try:
+        await _proc.process_audio_stream(fake)
+    except Exception:
+        pass
 
 @app.on_event("startup")
 async def startup():
@@ -80,6 +94,8 @@ async def startup():
         max_latency_ms=200,
         vad_threshold=0.01,
     )
+    # Warmup once to reduce first-turn latency/plan selection
+    await _warmup_pipeline()
 
 @app.get("/health")
 async def health():
@@ -92,60 +108,60 @@ async def stats():
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
     await ws.accept()
-    # Outgoing audio queue; frames are np.int16 arrays
     send_buffer: Deque[np.ndarray] = deque()
+    sent_frames_total = 0
     try:
         while True:
-            # If we already have audio to send, prioritize draining it
-            if send_buffer:
+            # Drain queued audio first, at realtime pace
+            while send_buffer:
                 frame_np = send_buffer.popleft()
                 await ws.send_bytes(frame_np.tobytes())
-                # small yield to avoid starving receive
-                await asyncio.sleep(0)
-                continue
+                sent_frames_total += 1
+                if sent_frames_total % 20 == 0:
+                    print(f"[STREAM] Sent frames: {sent_frames_total}")
+                await asyncio.sleep(FRAME_PACING_SEC)
 
-            # Otherwise receive next input chunk (blocks briefly)
+            # Receive next input or ping
             msg = await ws.receive()
             if 'bytes' in msg and msg['bytes'] is not None:
                 in_bytes = msg['bytes']
                 audio_i16 = np.frombuffer(in_bytes, dtype=np.int16)
-                # Normalize to float32 [-1,1]
+                print(f"[USER] Received {len(audio_i16)} samples")
                 audio = torch.from_numpy(audio_i16.astype(np.float32) / 32767.0).to(_device)
 
-                # Let processor handle REPLY_MODE=turn logic
                 out = await _proc.process_audio_stream(audio)
-
-                # If a response waveform was produced, queue entire output
                 if out is not None:
                     if out.dim() > 1:
                         out = out.view(-1)
-                    # sanitize
                     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
                     out = torch.clamp(out, -1.0, 1.0)
                     out = _limit(out, 0.98)
 
-                    # resample once from vocoder sr -> transport 24k
                     src_sr = getattr(_tok.vocoder, 'sample_rate', TRANSPORT_SR) if _tok else TRANSPORT_SR
                     out_cpu = out.detach().cpu()
                     if src_sr != TRANSPORT_SR:
                         out_cpu = _resample_linear(out_cpu, src_sr, TRANSPORT_SR)
+                    total_samples = out_cpu.numel()
+                    print(f"[AI] Response samples: {total_samples} at {TRANSPORT_SR} Hz (~{total_samples/TRANSPORT_SR:.2f}s)")
 
-                    # segment into fixed frames and enqueue
-                    total = out_cpu.numel()
+                    # Segment into 20ms frames and enqueue
+                    total = total_samples
                     start = 0
+                    queued = 0
                     while start < total:
                         end = min(start + FRAME_SAMPLES, total)
                         frame = out_cpu[start:end]
                         if frame.numel() < FRAME_SAMPLES:
-                            pad = FRAME_SAMPLES - frame.numel()
-                            frame = torch.nn.functional.pad(frame, (0, pad))
+                            frame = torch.nn.functional.pad(frame, (0, FRAME_SAMPLES - frame.numel()))
                         frame_i16 = (frame.numpy() * 32767.0).astype(np.int16)
                         send_buffer.append(frame_i16)
                         start = end
+                        queued += 1
+                    print(f"[STREAM] Queued frames: {queued} (frame_ms={FRAME_MS})")
 
-            # brief yield
             await asyncio.sleep(0)
     except WebSocketDisconnect:
+        print("[WS] Client disconnected")
         pass
 
 if __name__ == "__main__":
