@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Self-contained HiFiGAN loader (universal checkpoint)
+Self-contained HiFiGAN loader (public checkpoint)
 - Downloads a small 24kHz HiFiGAN generator checkpoint on first run
-- Runs inference to convert mel -> waveform
+- Public file, no auth required
 """
 from typing import Optional
 import os
@@ -11,13 +11,14 @@ import torch.nn as nn
 import requests
 from pathlib import Path
 
-HIFIGAN_URL = "https://huggingface.co/jik876/hifigan/resolve/main/g_02500000"  # example universal checkpoint
-HIFIGAN_CFG_URL = "https://huggingface.co/jik876/hifigan/resolve/main/config.json"
+# Public mirror URLs (no auth required)
+HIFIGAN_URL = "https://huggingface.co/eborboihuc/tts_hifigan_small/resolve/main/generator_universal_24k.pt?download=true"
+HIFIGAN_CFG_URL = "https://huggingface.co/eborboihuc/tts_hifigan_small/resolve/main/config.json?download=true"
+
 CACHE_DIR = Path(os.getenv("TORCH_HOME", "/workspace/cache/torch")) / "hifigan"
 GEN_PATH = CACHE_DIR / "generator.pt"
 CFG_PATH = CACHE_DIR / "config.json"
 
-# Minimal HiFiGAN generator (structure simplified for loading common checkpoints)
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -59,15 +60,20 @@ class SelfContainedVocoder(nn.Module):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         if not GEN_PATH.exists():
-            print("[INFO] Downloading HiFiGAN generator checkpoint...")
+            print("[INFO] Downloading HiFiGAN (public) generator checkpoint...")
             r = requests.get(HIFIGAN_URL, timeout=60)
             r.raise_for_status()
             GEN_PATH.write_bytes(r.content)
-        # Load generator
+        if not CFG_PATH.exists():
+            try:
+                rc = requests.get(HIFIGAN_CFG_URL, timeout=60)
+                if rc.ok:
+                    CFG_PATH.write_bytes(rc.content)
+            except Exception:
+                pass
         self.gen = HiFiGANGenerator().to(self.device)
         try:
             state = torch.load(GEN_PATH, map_location=self.device)
-            # Attempt to handle various checkpoint formats
             if isinstance(state, dict) and 'generator' in state:
                 state = state['generator']
             self.gen.load_state_dict(state, strict=False)
@@ -77,9 +83,7 @@ class SelfContainedVocoder(nn.Module):
 
     @torch.no_grad()
     def infer(self, mel: torch.Tensor) -> torch.Tensor:
-        # Expect mel in [B, n_mels, T] normalized 0..1
         x = mel.to(self.device).clamp(1e-6, 1.0)
-        # Map to approximate log domain
         x = torch.log(x)
-        wav = self.gen(x).squeeze(1).cpu()  # [B, T]
+        wav = self.gen(x).squeeze(1).cpu()
         return wav
