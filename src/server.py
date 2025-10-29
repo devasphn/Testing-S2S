@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+Serve both API, WS and the built-in /web UI.
+"""
 import asyncio
 from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -9,6 +12,8 @@ import numpy as np
 
 from src.models import HybridS2SModel, SpeechTokenizer
 from src.models.streaming_processor import StreamingProcessor
+from src.api_config import router as api_router
+from src.web_route import router as web_router
 
 app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.0")
 
@@ -20,6 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(api_router, prefix="/api")
+app.include_router(web_router)
+
 _model: Optional[HybridS2SModel] = None
 _tok: Optional[SpeechTokenizer] = None
 _proc: Optional[StreamingProcessor] = None
@@ -29,7 +37,7 @@ _device = "cuda" if torch.cuda.is_available() else "cpu"
 async def startup():
     global _model, _tok, _proc
     _tok = SpeechTokenizer().to(_device)
-    _model = HybridS2SModel(HybridS2SModel.config_class()).to(_device).eval()
+    _model = HybridS2SModel().to(_device).eval()
     _proc = StreamingProcessor(
         model=_model,
         speech_tokenizer=_tok,
@@ -62,8 +70,5 @@ async def ws_stream(ws: WebSocket):
     except WebSocketDisconnect:
         pass
 
-def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True)
-
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True)
