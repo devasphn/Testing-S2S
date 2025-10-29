@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streaming Processor - Turn-based Mode with VAD
+Streaming Processor - Turn-based Mode with detailed logging and longer responses
 """
 from collections import deque
 from typing import Optional, Dict, List
@@ -132,22 +132,32 @@ class StreamingProcessor:
             with torch.no_grad():
                 ids = self.tok.tokenize(chunk.unsqueeze(0).to(self.device))
             self.turn_buffer.append(ids)
+            print(f"[USER] Turn collecting: chunks={len(self.turn_buffer)}")
             self.response_generated = False
             return None
 
         if vad_result["turn_ended"] and self.turn_buffer and not self.response_generated:
+            print(f"[USER] Turn ended: total_chunks={len(self.turn_buffer)} → generating response")
             self.generating_response = True
             try:
                 turn_ids = torch.cat(self.turn_buffer, dim=1)
                 self.user_hist.append(turn_ids)
-                user_ctx = self._context(self.user_hist, 16)
+                user_ctx = self._context(self.user_hist, 24)  # longer context for turn-based
                 with torch.no_grad():
+                    # Increase max_new_tokens to produce longer audio
                     new_ids = self.model.generate_streaming(
-                        user_ctx, max_new_tokens=16, temperature=0.9
+                        user_ctx, max_new_tokens=48, temperature=0.9
                     )
                     self.ai_hist.append(new_ids)
                     out_audio = self.tok.detokenize(new_ids)
-                self.lat_hist.append((time.time() - t0) * 1000.0)
+                latency_ms = (time.time() - t0) * 1000.0
+                self.lat_hist.append(latency_ms)
+                # Log output duration estimate (assuming tokenizer's mel hop ~80ms per token in this demo)
+                try:
+                    samples = out_audio.numel() if out_audio.dim()==1 else out_audio.view(-1).numel()
+                    print(f"[AI] Generated tokens≈{new_ids.numel()} → samples={samples}")
+                except Exception:
+                    pass
                 return out_audio.squeeze(0)
             finally:
                 self.turn_buffer.clear()
