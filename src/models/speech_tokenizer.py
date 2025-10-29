@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tokenizer now uses self-contained HiFiGAN vocoder.
+Tokenizer now uses public HiFiGAN vocoder (no auth required).
 """
 from typing import Tuple
 import torch
@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import librosa
-from .vocoder_self import SelfContainedVocoder
+from .hifigan_public import PublicHiFiGANVocoder
 
 class SpeechTokenizer(nn.Module):
     def __init__(self, n_mels: int = 80, sample_rate: int = 24000, hop_ms: int = 80, codebook_size: int = 1024, hidden: int = 256):
@@ -33,7 +33,11 @@ class SpeechTokenizer(nn.Module):
             nn.ConvTranspose1d(hidden, n_mels, 3, padding=1),
         )
         self.codebook = nn.Parameter(torch.randn(codebook_size, hidden) * 0.02)
-        self.vocoder = SelfContainedVocoder()
+        
+        # Use public HiFiGAN vocoder (no auth required)
+        print("[INFO] Initializing PublicHiFiGANVocoder...")
+        self.vocoder = PublicHiFiGANVocoder()
+        print("[INFO] PublicHiFiGANVocoder ready")
 
     def audio_to_mel(self, audio: torch.Tensor) -> torch.Tensor:
         if audio.dim() == 1:
@@ -83,3 +87,10 @@ class SpeechTokenizer(nn.Module):
         mel = self.decode(q)
         audio = self.mel_to_audio(mel)
         return audio
+        
+    def to(self, device):
+        """Move model to device including vocoder."""
+        super().to(device)
+        if hasattr(self.vocoder, 'to'):
+            self.vocoder.to(device)
+        return self
