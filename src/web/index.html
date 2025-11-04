@@ -13,12 +13,15 @@
     .row { margin: 16px 0; }
     label { display: block; margin-bottom: 6px; font-weight: 500; }
     input[type=text] { width: 100%; padding: 8px; border: 1px solid #ced4da; border-radius: 4px; }
+    input[type=range] { width: 200px; }
     button { padding: 10px 20px; margin-right: 10px; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn-start { background: #28a745; color: white; }
     .btn-stop { background: #dc3545; color: white; }
+    .btn-mute { background: #6c757d; color: white; }
     #logs { height: 300px; overflow: auto; background: #f8f9fa; border: 1px solid #dee2e6; padding: 12px; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; }
     .audio-controls { margin: 16px 0; padding: 12px; background: #e9ecef; border-radius: 4px; }
+    .volume-control { display: inline-block; margin-left: 15px; }
   </style>
 </head>
 <body>
@@ -35,6 +38,12 @@
       <div class="row">
         <button id="start" class="btn-start">🎤 Start Audio</button>
         <button id="stop" class="btn-stop" disabled>⏹️ Stop</button>
+        <button id="mute" class="btn-mute">🔊 Mute</button>
+        <div class="volume-control">
+          <label>Volume:</label>
+          <input id="volume" type="range" min="0" max="100" value="90" />
+          <span id="volumeValue">90%</span>
+        </div>
       </div>
       <small>📝 <strong>Instructions:</strong> Click Start, allow microphone, speak and pause to hear AI response in turn mode.</small>
     </div>
@@ -51,7 +60,13 @@ const logsEl = document.getElementById('logs');
 const wsUrlEl = document.getElementById('wsUrl');
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
-let ws=null, media=null, ctx=null, proc=null;
+const muteBtn = document.getElementById('mute');
+const volumeSlider = document.getElementById('volume');
+const volumeValue = document.getElementById('volumeValue');
+
+let ws = null, media = null, ctx = null, proc = null, gain = null;
+let scheduleTime = 0; // Gapless playback timeline
+let isMuted = false;
 
 // Auto-detect WebSocket URL
 function detectWebSocketUrl() {
@@ -89,6 +104,60 @@ function f32_to_i16(f) {
     return b;
 }
 
+// Gapless audio playback with proper scheduling
+function playAudioFrame(audioData) {
+    try {
+        const i16 = new Int16Array(audioData);
+        const f32 = new Float32Array(i16.length);
+        for (let i = 0; i < i16.length; i++) {
+            f32[i] = i16[i] / 32768.0;
+        }
+        
+        // Create buffer at correct sample rate
+        const buffer = ctx.createBuffer(1, f32.length, 24000);
+        buffer.getChannelData(0).set(f32);
+        
+        // Gapless scheduling: maintain continuous timeline
+        const now = ctx.currentTime;
+        if (scheduleTime < now) {
+            scheduleTime = now;
+        }
+        
+        // Create source and schedule
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(gain); // Connect to gain node, not directly to destination
+        source.start(scheduleTime);
+        
+        // Advance timeline by buffer duration
+        const duration = f32.length / 24000;
+        scheduleTime += duration;
+        
+        log(`🔊 Scheduled audio: ${i16.length} samples (${(duration*1000).toFixed(1)}ms) at ${scheduleTime.toFixed(3)}s`);
+        
+    } catch (e) {
+        log(`❌ Audio playback error: ${e.message}`);
+        console.error('Audio playback error:', e);
+    }
+}
+
+// Update volume
+function updateVolume() {
+    const vol = parseInt(volumeSlider.value) / 100;
+    volumeValue.textContent = `${volumeSlider.value}%`;
+    if (gain) {
+        gain.gain.setValueAtTime(isMuted ? 0 : vol, ctx.currentTime);
+    }
+}
+
+// Toggle mute
+function toggleMute() {
+    isMuted = !isMuted;
+    muteBtn.textContent = isMuted ? '🔇 Unmute' : '🔊 Mute';
+    updateVolume();
+    log(isMuted ? '🔇 Audio muted' : '🔊 Audio unmuted');
+}
+
 async function start() {
     const url = wsUrlEl.value.trim();
     if (!url) {
@@ -99,6 +168,26 @@ async function start() {
     try {
         log('🔌 Connecting to WebSocket...');
         setStatus('Connecting...', 'status-idle');
+        
+        // Setup AudioContext first
+        ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        
+        // Force resume AudioContext (browser autoplay policy)
+        if (ctx.state === 'suspended') {
+            log('🔄 Resuming suspended AudioContext...');
+            await ctx.resume();
+        }
+        log(`🎵 AudioContext state: ${ctx.state}, sampleRate: ${ctx.sampleRate}`);
+        
+        // Create master gain node
+        gain = ctx.createGain();
+        gain.connect(ctx.destination);
+        updateVolume();
+        log('🎚️ Audio gain node created');
+        
+        // Reset playback timeline
+        scheduleTime = ctx.currentTime;
+        log(`⏰ Playback timeline initialized at ${scheduleTime.toFixed(3)}s`);
         
         ws = new WebSocket(url);
         ws.binaryType = 'arraybuffer';
@@ -125,24 +214,8 @@ async function start() {
                 return;
             }
             
-            try {
-                const i16 = new Int16Array(ev.data);
-                const f = new Float32Array(i16.length);
-                for (let i = 0; i < i16.length; i++) {
-                    f[i] = i16[i] / 32768.0;
-                }
-                
-                const buffer = ctx.createBuffer(1, f.length, 24000);
-                buffer.getChannelData(0).set(f);
-                const source = ctx.createBufferSource();
-                source.buffer = buffer;
-                source.connect(ctx.destination);
-                source.start();
-                
-                log(`🔊 Playing audio: ${i16.length} samples (${(i16.length/24000*1000).toFixed(1)}ms)`);
-            } catch (e) {
-                log(`❌ Audio playback error: ${e.message}`);
-            }
+            // Use gapless playback scheduler
+            playAudioFrame(ev.data);
         };
         
         // Request microphone access
@@ -159,13 +232,17 @@ async function start() {
         
         log('✅ Microphone access granted');
         
-        // Setup audio context
-        ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        // Setup audio input processing
         const source = ctx.createMediaStreamSource(media);
         proc = ctx.createScriptProcessor(2048, 1, 1);
         
         proc.onaudioprocess = (e) => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            // Ensure AudioContext stays active
+            if (ctx.state === 'suspended') {
+                ctx.resume();
+            }
             
             const inputData = e.inputBuffer.getChannelData(0);
             const chunkSize = 1920; // 80ms at 24kHz
@@ -202,7 +279,12 @@ function stop() {
         proc = null;
         log('🔇 Audio processor disconnected');
     }
-    if (ctx) {
+    if (gain) {
+        gain.disconnect();
+        gain = null;
+        log('🎚️ Gain node disconnected');
+    }
+    if (ctx && ctx.state !== 'closed') {
         ctx.close();
         ctx = null;
         log('🔇 Audio context closed');
@@ -220,6 +302,7 @@ function stop() {
         log('🔌 WebSocket disconnected');
     }
     
+    scheduleTime = 0;
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('Stopped', 'status-idle');
@@ -227,6 +310,14 @@ function stop() {
 
 startBtn.onclick = start;
 stopBtn.onclick = stop;
+muteBtn.onclick = toggleMute;
+volumeSlider.oninput = updateVolume;
+
+// Initialize
+document.addEventListener('DOMContentLoaded', () => {
+    log('🚀 Testing-S2S Web Interface Ready');
+    log('💡 Tip: Make sure server is running with REPLY_MODE=turn for best experience');
+});
 
 // Auto-retry connection on failure
 let retryCount = 0;
@@ -242,10 +333,13 @@ function attemptReconnect() {
     }
 }
 
-// Add retry on connection failure
-document.addEventListener('DOMContentLoaded', () => {
-    log('🚀 Testing-S2S Web Interface Ready');
-    log('💡 Tip: Make sure server is running with REPLY_MODE=turn for best experience');
+// Handle browser tab focus for AudioContext resume
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && ctx && ctx.state === 'suspended') {
+        ctx.resume().then(() => {
+            log('🔄 AudioContext resumed after tab focus');
+        });
+    }
 });
 </script>
 </body>
