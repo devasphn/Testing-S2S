@@ -2,26 +2,48 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Testing-S2S /web</title>
+  <title>Testing-S2S Live</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    #status { margin: 8px 0; }
-    .row { margin: 10px 0; }
-    input[type=text] { width: 600px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background: #f8f9fa; }
+    .container { max-width: 800px; margin: 0 auto; background: white; padding: 24px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    #status { margin: 12px 0; padding: 8px 12px; border-radius: 4px; font-weight: 500; }
+    .status-connected { background: #d4edda; color: #155724; }
+    .status-error { background: #f8d7da; color: #721c24; }
+    .status-idle { background: #e2e3e5; color: #383d41; }
+    .row { margin: 16px 0; }
+    label { display: block; margin-bottom: 6px; font-weight: 500; }
+    input[type=text] { width: 100%; padding: 8px; border: 1px solid #ced4da; border-radius: 4px; }
+    button { padding: 10px 20px; margin-right: 10px; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-start { background: #28a745; color: white; }
+    .btn-stop { background: #dc3545; color: white; }
+    #logs { height: 300px; overflow: auto; background: #f8f9fa; border: 1px solid #dee2e6; padding: 12px; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; }
+    .audio-controls { margin: 16px 0; padding: 12px; background: #e9ecef; border-radius: 4px; }
   </style>
 </head>
 <body>
-  <h1>Testing-S2S Live</h1>
-  <div id="status">Idle</div>
-  <div class="row">
-    <label>WS URL:</label>
-    <input id="wsUrl" type="text" value="wss://YOUR-POD.direct.runpod.net:8000/ws/stream" />
+  <div class="container">
+    <h1>🎧 Testing-S2S Live</h1>
+    <div id="status" class="status-idle">Idle - Click Start to begin</div>
+    
+    <div class="row">
+      <label>WebSocket URL:</label>
+      <input id="wsUrl" type="text" value="" placeholder="Auto-detected..." />
+    </div>
+    
+    <div class="audio-controls">
+      <div class="row">
+        <button id="start" class="btn-start">🎤 Start Audio</button>
+        <button id="stop" class="btn-stop" disabled>⏹️ Stop</button>
+      </div>
+      <small>📝 <strong>Instructions:</strong> Click Start, allow microphone, speak and pause to hear AI response in turn mode.</small>
+    </div>
+    
+    <div class="row">
+      <label>Connection Logs:</label>
+      <div id="logs"></div>
+    </div>
   </div>
-  <div class="row">
-    <button id="start">Start</button>
-    <button id="stop" disabled>Stop</button>
-  </div>
-  <pre id="logs" style="height:200px;overflow:auto;background:#f5f5f5;padding:12px;"></pre>
 
 <script>
 const statusEl = document.getElementById('status');
@@ -31,30 +53,200 @@ const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
 let ws=null, media=null, ctx=null, proc=null;
 
-function log(m){ logsEl.textContent += m+"\n"; logsEl.scrollTop = logsEl.scrollHeight; }
-function f32_to_i16(f){
-  const b = new ArrayBuffer(f.length*2); const v = new DataView(b); let o=0;
-  for(let i=0;i<f.length;i++,o+=2){ let s=Math.max(-1,Math.min(1,f[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true);} return b;
+// Auto-detect WebSocket URL
+function detectWebSocketUrl() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    return `${protocol}//${host}/ws/stream`;
 }
 
-async function start(){
-  const url = wsUrlEl.value.trim(); if(!url){ alert('Enter WS URL'); return; }
-  ws = new WebSocket(url); ws.binaryType = 'arraybuffer';
-  ws.onopen = ()=>{ log('WS open'); statusEl.textContent='Connected'; };
-  ws.onclose= ()=>{ log('WS close'); statusEl.textContent='Closed'; };
-  ws.onerror= e=>{ log('WS error'); };
-  ws.onmessage = ev=>{ if(!(ev.data instanceof ArrayBuffer)) return; const i16=new Int16Array(ev.data); const f=new Float32Array(i16.length); for(let i=0;i<i16.length;i++) f[i]=i16[i]/32768.0; const b=ctx.createBuffer(1,f.length,24000); b.getChannelData(0).set(f); const src=ctx.createBufferSource(); src.buffer=b; src.connect(ctx.destination); src.start(); };
+// Set auto-detected URL on load
+window.addEventListener('load', () => {
+    const autoUrl = detectWebSocketUrl();
+    wsUrlEl.value = autoUrl;
+    log(`🔍 Auto-detected WebSocket URL: ${autoUrl}`);
+});
 
-  media = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,sampleRate:24000, echoCancellation:true, noiseSuppression:true}});
-  ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
-  const src = ctx.createMediaStreamSource(media);
-  proc = ctx.createScriptProcessor(2048,1,1);
-  proc.onaudioprocess = e=>{ if(!ws||ws.readyState!==1) return; const ch=e.inputBuffer.getChannelData(0); const size=1920; for(let i=0;i<ch.length;i+=size){ const sl=ch.subarray(i, Math.min(i+size, ch.length)); ws.send(f32_to_i16(sl)); } };
-  src.connect(proc); proc.connect(ctx.destination);
-  startBtn.disabled=true; stopBtn.disabled=false;
+function setStatus(text, className) {
+    statusEl.textContent = text;
+    statusEl.className = className;
 }
-function stop(){ if(proc){proc.disconnect(); proc=null;} if(ctx){ctx.close(); ctx=null;} if(media){media.getTracks().forEach(t=>t.stop()); media=null;} if(ws){ws.close(); ws=null;} startBtn.disabled=false; stopBtn.disabled=true; statusEl.textContent='Idle'; }
-startBtn.onclick=start; stopBtn.onclick=stop;
+
+function log(m) { 
+    const timestamp = new Date().toLocaleTimeString();
+    logsEl.textContent += `[${timestamp}] ${m}\n`; 
+    logsEl.scrollTop = logsEl.scrollHeight; 
+}
+
+function f32_to_i16(f) {
+    const b = new ArrayBuffer(f.length * 2);
+    const v = new DataView(b);
+    let o = 0;
+    for (let i = 0; i < f.length; i++, o += 2) {
+        let s = Math.max(-1, Math.min(1, f[i]));
+        v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return b;
+}
+
+async function start() {
+    const url = wsUrlEl.value.trim();
+    if (!url) {
+        alert('❌ Please enter WebSocket URL');
+        return;
+    }
+    
+    try {
+        log('🔌 Connecting to WebSocket...');
+        setStatus('Connecting...', 'status-idle');
+        
+        ws = new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+        
+        ws.onopen = () => {
+            log('✅ WebSocket connected successfully');
+            setStatus('Connected - Ready for audio', 'status-connected');
+        };
+        
+        ws.onclose = (event) => {
+            log(`❌ WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
+            setStatus('Connection closed', 'status-error');
+        };
+        
+        ws.onerror = (error) => {
+            log('❌ WebSocket error occurred');
+            console.error('WebSocket error:', error);
+            setStatus('Connection error', 'status-error');
+        };
+        
+        ws.onmessage = (ev) => {
+            if (!(ev.data instanceof ArrayBuffer)) {
+                log('⚠️ Received non-binary data');
+                return;
+            }
+            
+            try {
+                const i16 = new Int16Array(ev.data);
+                const f = new Float32Array(i16.length);
+                for (let i = 0; i < i16.length; i++) {
+                    f[i] = i16[i] / 32768.0;
+                }
+                
+                const buffer = ctx.createBuffer(1, f.length, 24000);
+                buffer.getChannelData(0).set(f);
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                source.start();
+                
+                log(`🔊 Playing audio: ${i16.length} samples (${(i16.length/24000*1000).toFixed(1)}ms)`);
+            } catch (e) {
+                log(`❌ Audio playback error: ${e.message}`);
+            }
+        };
+        
+        // Request microphone access
+        log('🎤 Requesting microphone access...');
+        media = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                sampleRate: 24000,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        });
+        
+        log('✅ Microphone access granted');
+        
+        // Setup audio context
+        ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        const source = ctx.createMediaStreamSource(media);
+        proc = ctx.createScriptProcessor(2048, 1, 1);
+        
+        proc.onaudioprocess = (e) => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            const inputData = e.inputBuffer.getChannelData(0);
+            const chunkSize = 1920; // 80ms at 24kHz
+            
+            for (let i = 0; i < inputData.length; i += chunkSize) {
+                const slice = inputData.subarray(i, Math.min(i + chunkSize, inputData.length));
+                if (slice.length > 0) {
+                    const buffer = f32_to_i16(slice);
+                    ws.send(buffer);
+                }
+            }
+        };
+        
+        source.connect(proc);
+        proc.connect(ctx.destination);
+        
+        log('🎵 Audio pipeline ready - speak now!');
+        setStatus('🎤 Listening... (speak and pause for response)', 'status-connected');
+        
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        
+    } catch (err) {
+        log(`❌ Error during setup: ${err.message}`);
+        setStatus('Setup failed', 'status-error');
+        console.error('Setup error:', err);
+        stop();
+    }
+}
+
+function stop() {
+    if (proc) {
+        proc.disconnect();
+        proc = null;
+        log('🔇 Audio processor disconnected');
+    }
+    if (ctx) {
+        ctx.close();
+        ctx = null;
+        log('🔇 Audio context closed');
+    }
+    if (media) {
+        media.getTracks().forEach(track => {
+            track.stop();
+            log(`🛑 Stopped ${track.kind} track`);
+        });
+        media = null;
+    }
+    if (ws) {
+        ws.close();
+        ws = null;
+        log('🔌 WebSocket disconnected');
+    }
+    
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus('Stopped', 'status-idle');
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+
+// Auto-retry connection on failure
+let retryCount = 0;
+function attemptReconnect() {
+    if (retryCount < 3) {
+        retryCount++;
+        log(`🔄 Auto-retry attempt ${retryCount}/3 in 2s...`);
+        setTimeout(() => {
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+                start();
+            }
+        }, 2000);
+    }
+}
+
+// Add retry on connection failure
+document.addEventListener('DOMContentLoaded', () => {
+    log('🚀 Testing-S2S Web Interface Ready');
+    log('💡 Tip: Make sure server is running with REPLY_MODE=turn for best experience');
+});
 </script>
 </body>
 </html>
