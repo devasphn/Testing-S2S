@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Serve both API, WS and the built-in /web UI.
+Serve both API, WS and the built-in /web UI with enhanced WebSocket logging.
 """
 import asyncio
 from typing import Optional, Deque
 from collections import deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import torch
 import numpy as np
+import traceback
 
 from src.models import HybridS2SModel, SpeechTokenizer
 from src.models.streaming_processor import StreamingProcessor
@@ -23,7 +24,7 @@ try:
 except Exception:
     pass
 
-app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.5")
+app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +47,9 @@ TRANSPORT_SR = 24000
 FRAME_MS = 20  # 20ms frames (480 samples @ 24k)
 FRAME_SAMPLES = int(TRANSPORT_SR * FRAME_MS / 1000)
 FRAME_PACING_SEC = FRAME_MS / 1000.0
+
+# Connection tracking
+active_connections = set()
 
 # Resampling helper (22.05 kHz -> 24 kHz)
 def _resample_linear(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
@@ -74,15 +78,18 @@ async def _warmup_pipeline():
     global _proc
     if _proc is None:
         return
+    print("[INFO] Running pipeline warmup...")
     fake = torch.zeros(int(TRANSPORT_SR * 0.08), dtype=torch.float32, device=_device)
     try:
         await _proc.process_audio_stream(fake)
-    except Exception:
-        pass
+        print("[INFO] Pipeline warmup completed")
+    except Exception as e:
+        print(f"[WARN] Pipeline warmup failed: {e}")
 
 @app.on_event("startup")
 async def startup():
     global _model, _tok, _proc
+    print(f"[INFO] Starting server on device: {_device}")
     _tok = SpeechTokenizer().to(_device)
     _model = HybridS2SModel().to(_device).eval()
     _proc = StreamingProcessor(
@@ -95,37 +102,65 @@ async def startup():
     )
     # Warmup once to reduce first-turn latency/plan selection
     await _warmup_pipeline()
+    print("[INFO] Server startup complete - WebSocket endpoint ready at /ws/stream")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "device": _device}
+    return {
+        "status": "ok", 
+        "device": _device, 
+        "active_connections": len(active_connections),
+        "reply_mode": _proc.reply_mode if _proc else "unknown"
+    }
 
 @app.get("/api/stats")
 async def stats():
-    return {"latency_ms": _proc.get_latency_stats() if _proc else {}}
+    return {
+        "latency_ms": _proc.get_latency_stats() if _proc else {},
+        "connections": len(active_connections)
+    }
 
 @app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket):
-    await ws.accept()
-    send_buffer: Deque[np.ndarray] = deque()
-    sent_frames_total = 0
+async def ws_stream(websocket: WebSocket):
+    client_id = f"{websocket.client.host}:{websocket.client.port}"
+    print(f"[WS] Connection attempt from {client_id}")
+    
     try:
+        await websocket.accept()
+        active_connections.add(websocket)
+        print(f"[WS] ✅ Connection accepted: {client_id} (total: {len(active_connections)})")
+        
+        send_buffer: Deque[np.ndarray] = deque()
+        sent_frames_total = 0
+        received_chunks = 0
+        
         while True:
             # Drain queued audio first, at realtime pace
             while send_buffer:
                 frame_np = send_buffer.popleft()
-                await ws.send_bytes(frame_np.tobytes())
+                await websocket.send_bytes(frame_np.tobytes())
                 sent_frames_total += 1
-                if sent_frames_total % 20 == 0:
-                    print(f"[STREAM] Sent frames: {sent_frames_total}")
+                if sent_frames_total % 50 == 0:  # Log every 50 frames (1s)
+                    print(f"[STREAM] 🔊 Sent {sent_frames_total} frames to {client_id}")
                 await asyncio.sleep(FRAME_PACING_SEC)
 
             # Receive next input or ping
-            msg = await ws.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                print(f"[WS] ❌ Receive error from {client_id}: {e}")
+                break
+                
             if 'bytes' in msg and msg['bytes'] is not None:
                 in_bytes = msg['bytes']
                 audio_i16 = np.frombuffer(in_bytes, dtype=np.int16)
-                print(f"[USER] Received {len(audio_i16)} samples")
+                received_chunks += 1
+                
+                if received_chunks % 100 == 0:  # Log every 100 chunks
+                    print(f"[USER] 🎤 Received {received_chunks} chunks from {client_id}")
+                
                 audio = torch.from_numpy(audio_i16.astype(np.float32) / 32767.0).to(_device)
 
                 out = await _proc.process_audio_stream(audio)
@@ -141,14 +176,14 @@ async def ws_stream(ws: WebSocket):
                     if src_sr != TRANSPORT_SR:
                         out_cpu = _resample_linear(out_cpu, src_sr, TRANSPORT_SR)
                     total_samples = out_cpu.numel()
-                    print(f"[AI] Response samples: {total_samples} at {TRANSPORT_SR} Hz (~{total_samples/TRANSPORT_SR:.2f}s)")
+                    duration = total_samples / TRANSPORT_SR
+                    print(f"[AI] 🤖 Generated response: {total_samples} samples ({duration:.2f}s) for {client_id}")
 
                     # Segment into 20ms frames and enqueue
-                    total = total_samples
                     start = 0
                     queued = 0
-                    while start < total:
-                        end = min(start + FRAME_SAMPLES, total)
+                    while start < total_samples:
+                        end = min(start + FRAME_SAMPLES, total_samples)
                         frame = out_cpu[start:end]
                         if frame.numel() < FRAME_SAMPLES:
                             frame = torch.nn.functional.pad(frame, (0, FRAME_SAMPLES - frame.numel()))
@@ -156,12 +191,21 @@ async def ws_stream(ws: WebSocket):
                         send_buffer.append(frame_i16)
                         start = end
                         queued += 1
-                    print(f"[STREAM] Queued frames: {queued} (frame_ms={FRAME_MS})")
+                    print(f"[STREAM] 📦 Queued {queued} frames ({duration:.2f}s) for {client_id}")
 
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)  # Small yield to prevent blocking
+            
     except WebSocketDisconnect:
-        print("[WS] Client disconnected")
-        pass
+        print(f"[WS] 🔌 Client {client_id} disconnected normally")
+    except Exception as e:
+        print(f"[WS] ❌ Unexpected error with {client_id}: {e}")
+        print(f"[WS] 🔍 Traceback: {traceback.format_exc()}")
+    finally:
+        active_connections.discard(websocket)
+        print(f"[WS] 🧹 Cleaned up connection {client_id} (remaining: {len(active_connections)})")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True)
+    print(f"[INFO] 🚀 Starting Testing-S2S server on http://0.0.0.0:8000")
+    print(f"[INFO] 🌍 Web UI available at: http://0.0.0.0:8000/web")
+    print(f"[INFO] 🔌 WebSocket endpoint: ws://0.0.0.0:8000/ws/stream")
+    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True, log_level="info")
