@@ -11,6 +11,7 @@ import uvicorn
 import torch
 import numpy as np
 import traceback
+import os
 
 from src.models import HybridS2SModel, SpeechTokenizer
 from src.models.streaming_processor import StreamingProcessor
@@ -24,7 +25,10 @@ try:
 except Exception:
     pass
 
-app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.6")
+# Get reply mode
+REPLY_MODE = os.getenv("REPLY_MODE", "stream").lower()
+
+app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,7 +93,7 @@ async def _warmup_pipeline():
 @app.on_event("startup")
 async def startup():
     global _model, _tok, _proc
-    print(f"[INFO] Starting server on device: {_device}")
+    print(f"[INFO] Starting server on device: {_device} with REPLY_MODE={REPLY_MODE}")
     _tok = SpeechTokenizer().to(_device)
     _model = HybridS2SModel().to(_device).eval()
     _proc = StreamingProcessor(
@@ -99,10 +103,11 @@ async def startup():
         sample_rate=TRANSPORT_SR,
         max_latency_ms=200,
         vad_threshold=0.001,  # lower threshold to detect speech more easily
+        reply_mode=REPLY_MODE
     )
     # Warmup once to reduce first-turn latency/plan selection
     await _warmup_pipeline()
-    print("[INFO] Server startup complete - WebSocket endpoint ready at /ws/stream")
+    print(f"[INFO] Server startup complete - WebSocket endpoint ready at /ws/stream (mode: {REPLY_MODE})")
 
 @app.get("/health")
 async def health():
@@ -110,7 +115,7 @@ async def health():
         "status": "ok", 
         "device": _device, 
         "active_connections": len(active_connections),
-        "reply_mode": _proc.reply_mode if _proc else "unknown"
+        "reply_mode": REPLY_MODE
     }
 
 @app.get("/api/stats")
@@ -128,7 +133,7 @@ async def ws_stream(websocket: WebSocket):
     try:
         await websocket.accept()
         active_connections.add(websocket)
-        print(f"[WS] ✅ Connection accepted: {client_id} (total: {len(active_connections)})")
+        print(f"[WS] ✅ Connection accepted: {client_id} (total: {len(active_connections)}, mode: {REPLY_MODE})")
         
         send_buffer: Deque[np.ndarray] = deque()
         sent_frames_total = 0
@@ -140,11 +145,18 @@ async def ws_stream(websocket: WebSocket):
                 frame_np = send_buffer.popleft()
                 await websocket.send_bytes(frame_np.tobytes())
                 sent_frames_total += 1
-                if sent_frames_total % 50 == 0:  # Log every 50 frames (1s)
-                    print(f"[STREAM] 🔊 Sent {sent_frames_total} frames to {client_id}")
+                
+                # Log based on mode
+                if REPLY_MODE == "turn":
+                    if sent_frames_total % 25 == 0:  # Every 0.5s in turn mode
+                        print(f"[TURN] 🔊 Sent {sent_frames_total} frames to {client_id}")
+                else:
+                    if sent_frames_total % 50 == 0:  # Every 1s in stream mode
+                        print(f"[STREAM] 🔊 Sent {sent_frames_total} frames to {client_id}")
+                        
                 await asyncio.sleep(FRAME_PACING_SEC)
 
-            # Receive next input or ping
+            # Receive next input
             try:
                 msg = await websocket.receive()
             except WebSocketDisconnect:
@@ -158,8 +170,9 @@ async def ws_stream(websocket: WebSocket):
                 audio_i16 = np.frombuffer(in_bytes, dtype=np.int16)
                 received_chunks += 1
                 
-                if received_chunks % 100 == 0:  # Log every 100 chunks
-                    print(f"[USER] 🎤 Received {received_chunks} chunks from {client_id}")
+                # Log received audio less frequently
+                if received_chunks % 100 == 0:
+                    print(f"[USER] 🎤 Received {received_chunks} audio chunks from {client_id}")
                 
                 audio = torch.from_numpy(audio_i16.astype(np.float32) / 32767.0).to(_device)
 
@@ -177,7 +190,12 @@ async def ws_stream(websocket: WebSocket):
                         out_cpu = _resample_linear(out_cpu, src_sr, TRANSPORT_SR)
                     total_samples = out_cpu.numel()
                     duration = total_samples / TRANSPORT_SR
-                    print(f"[AI] 🤖 Generated response: {total_samples} samples ({duration:.2f}s) for {client_id}")
+                    
+                    # Log based on mode
+                    if REPLY_MODE == "turn":
+                        print(f"[TURN] 🤖 Generated response: {total_samples} samples ({duration:.2f}s) for {client_id}")
+                    else:
+                        print(f"[STREAM] 🤖 Generated response: {total_samples} samples ({duration:.2f}s) for {client_id}")
 
                     # Segment into 20ms frames and enqueue
                     start = 0
@@ -191,7 +209,12 @@ async def ws_stream(websocket: WebSocket):
                         send_buffer.append(frame_i16)
                         start = end
                         queued += 1
-                    print(f"[STREAM] 📦 Queued {queued} frames ({duration:.2f}s) for {client_id}")
+                    
+                    # Log based on mode
+                    if REPLY_MODE == "turn":
+                        print(f"[TURN] 📦 Queued {queued} frames ({duration:.2f}s) for {client_id}")
+                    else:
+                        print(f"[STREAM] 📦 Queued {queued} frames ({duration:.2f}s) for {client_id}")
 
             await asyncio.sleep(0.001)  # Small yield to prevent blocking
             
@@ -208,4 +231,5 @@ if __name__ == "__main__":
     print(f"[INFO] 🚀 Starting Testing-S2S server on http://0.0.0.0:8000")
     print(f"[INFO] 🌍 Web UI available at: http://0.0.0.0:8000/web")
     print(f"[INFO] 🔌 WebSocket endpoint: ws://0.0.0.0:8000/ws/stream")
+    print(f"[INFO] 🎯 Mode: {REPLY_MODE.upper()}")
     uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True, log_level="info")
