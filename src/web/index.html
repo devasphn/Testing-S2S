@@ -67,6 +67,7 @@ const volumeValue = document.getElementById('volumeValue');
 let ws = null, media = null, ctx = null, proc = null, gain = null;
 let scheduleTime = 0; // Gapless timeline
 let isMuted = false;
+let audioUnlocked = false; // Track if audio context is unlocked
 
 // Auto-detect WebSocket URL
 function detectWebSocketUrl() {
@@ -121,34 +122,68 @@ function toggleMute() {
     updateVolume();
 }
 
-// Play AudioContext unlock tone
+// Play AudioContext unlock tone with multiple attempts
 async function unlockAudioContext() {
-    if (!ctx) return;
+    if (!ctx) return false;
+    if (audioUnlocked) return true;
+    
     try {
-        // Create a tiny 440Hz sine wave (0.1s) at very low volume to unlock browser audio
-        const unlockBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.1, ctx.sampleRate);
+        // Force resume first
+        if (ctx.state === 'suspended') {
+            await ctx.resume();
+            log('🔄 AudioContext resumed before unlock');
+        }
+        
+        // Create a tiny 440Hz sine wave (0.15s) at audible but low volume
+        const unlockBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
         const data = unlockBuffer.getChannelData(0);
         for (let i = 0; i < data.length; i++) {
-            data[i] = Math.sin(2 * Math.PI * 440 * i / ctx.sampleRate) * 0.01; // Very quiet
+            data[i] = Math.sin(2 * Math.PI * 440 * i / ctx.sampleRate) * 0.1; // Slightly louder
         }
         
         const unlockSource = ctx.createBufferSource();
         unlockSource.buffer = unlockBuffer;
         unlockSource.connect(gain);
-        unlockSource.start(0);
+        unlockSource.start(ctx.currentTime);
         
-        await new Promise(resolve => {
-            unlockSource.onended = resolve;
+        await new Promise((resolve) => {
+            unlockSource.onended = () => {
+                audioUnlocked = true;
+                resolve();
+            };
+            // Fallback timeout
+            setTimeout(resolve, 200);
         });
         
-        log('🔓 AudioContext unlocked with test tone');
+        // Verify audio context is running
+        if (ctx.state === 'running') {
+            log('🔓 ✅ AudioContext unlocked successfully - test tone played');
+            audioUnlocked = true;
+            return true;
+        } else {
+            log(`⚠️ AudioContext state: ${ctx.state} after unlock attempt`);
+            return false;
+        }
     } catch (e) {
-        log(`⚠️ Unlock tone failed: ${e.message}`);
+        log(`❌ Unlock tone failed: ${e.message}`);
+        return false;
     }
 }
 
-// Play audio frame with gapless scheduling
+// Play audio frame with gapless scheduling and improved error handling
 function playAudioFrame(audioData) {
+    if (!ctx || !gain) {
+        log('❌ Cannot play: AudioContext or gain not initialized');
+        return;
+    }
+    
+    // Auto-resume if suspended
+    if (ctx.state === 'suspended') {
+        ctx.resume().then(() => {
+            log('🔄 Auto-resumed AudioContext for playback');
+        });
+    }
+    
     try {
         // Convert PCM16 to Float32
         const i16 = new Int16Array(audioData);
@@ -161,10 +196,10 @@ function playAudioFrame(audioData) {
         const buffer = ctx.createBuffer(1, f32.length, 24000);
         buffer.getChannelData(0).set(f32);
         
-        // Gapless scheduling
+        // Gapless scheduling with better timing
         const now = ctx.currentTime;
-        if (scheduleTime < now + 0.1) { // Allow small lookahead
-            scheduleTime = now;
+        if (scheduleTime < now + 0.05) { // Tighter lookahead for better sync
+            scheduleTime = now + 0.05; // Small buffer to prevent underruns
         }
         
         // Create source and schedule
@@ -178,7 +213,8 @@ function playAudioFrame(audioData) {
         scheduleTime += duration;
         
         const durationMs = (duration * 1000).toFixed(1);
-        log(`🔊 Playing: ${i16.length} samples (${durationMs}ms) at ${scheduleTime.toFixed(3)}s`);
+        const queueAhead = ((scheduleTime - now) * 1000).toFixed(0);
+        log(`🔊 Playing: ${i16.length} samples (${durationMs}ms) scheduled at +${queueAhead}ms | ctx=${ctx.state}`);
         
     } catch (e) {
         log(`❌ Playback error: ${e.message}`);
@@ -220,8 +256,17 @@ async function start() {
         scheduleTime = ctx.currentTime;
         log(`⏰ Timeline initialized at ${scheduleTime.toFixed(3)}s`);
         
-        // Play unlock tone to ensure audio path is active
-        await unlockAudioContext();
+        // Play unlock tone to ensure audio path is active (CRITICAL for browser audio)
+        const unlocked = await unlockAudioContext();
+        if (!unlocked) {
+            log('⚠️ Audio unlock may have failed - you might need to interact with the page');
+        }
+        
+        // Double-check AudioContext is running
+        if (ctx.state !== 'running') {
+            await ctx.resume();
+            log(`🔄 Force resumed AudioContext: ${ctx.state}`);
+        }
         
         // Connect WebSocket
         setStatus('Connecting to server...', 'status-idle');
@@ -250,8 +295,16 @@ async function start() {
                 return;
             }
             
-            // Play received audio frame
-            playAudioFrame(ev.data);
+            // Ensure AudioContext is running before playback
+            if (ctx.state === 'suspended') {
+                ctx.resume().then(() => {
+                    log('🔄 Auto-resumed for incoming audio');
+                    playAudioFrame(ev.data);
+                });
+            } else {
+                // Play received audio frame
+                playAudioFrame(ev.data);
+            }
         };
         
         // Setup microphone
@@ -275,7 +328,7 @@ async function start() {
         proc.onaudioprocess = (e) => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             
-            // Monitor AudioContext state
+            // Monitor AudioContext state and resume if needed
             if (ctx.state === 'suspended') {
                 ctx.resume();
                 log('🔄 Resumed AudioContext during recording');
@@ -293,8 +346,10 @@ async function start() {
             }
         };
         
+        // CRITICAL FIX: Do NOT connect input processor to destination!
+        // This was causing feedback and blocking playback
         source.connect(proc);
-        proc.connect(ctx.destination);
+        // proc.connect(ctx.destination); // REMOVED - input should not play to speakers
         
         log('🎵 Audio pipeline ready - speak now!');
         setStatus('🎤 Listening... (speak and pause for response)', 'status-connected');
@@ -340,6 +395,7 @@ function stop() {
     }
     
     scheduleTime = 0;
+    audioUnlocked = false; // Reset for next session
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('Stopped', 'status-idle');
