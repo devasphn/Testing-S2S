@@ -119,9 +119,16 @@ class StreamingProcessor:
         self.user_hist.append(ids)
         user_ctx = self._context(self.user_hist, 8)
         with torch.no_grad():
-            new_ids = self.model.generate_streaming(user_ctx, max_new_tokens=4, temperature=0.95)
+            # Increased from 4 to 32 tokens to generate audible speech (~0.8s chunks)
+            new_ids = self.model.generate_streaming(user_ctx, max_new_tokens=32, temperature=0.95)
             self.ai_hist.append(new_ids)
             out_audio = self.tok.detokenize(new_ids)
+        
+        # Debug: Check audio amplitude
+        audio_max = out_audio.abs().max().item()
+        audio_mean = out_audio.abs().mean().item()
+        print(f"[STREAM DEBUG] Generated {out_audio.shape[0]} samples | max={audio_max:.4f} mean={audio_mean:.4f}")
+        
         self.lat_hist.append((time.time() - t0) * 1000.0)
         return out_audio.squeeze(0)
 
