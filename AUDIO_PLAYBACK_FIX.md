@@ -13,14 +13,18 @@ source.connect(proc);
 proc.connect(ctx.destination); // ❌ This creates feedback!
 ```
 
-**Fix**: Remove the connection to destination
+**Fix**: Connect to a silent gain node instead
 ```javascript
 // NEW CODE (CORRECT):
+silentGain = ctx.createGain();
+silentGain.gain.value = 0; // Completely silent
+silentGain.connect(ctx.destination);
+
 source.connect(proc);
-// proc.connect(ctx.destination); // ✅ REMOVED - input should not play to speakers
+proc.connect(silentGain); // ✅ Keeps processor alive without feedback
 ```
 
-**Why this matters**: Connecting the microphone processor to speakers creates a feedback loop and interferes with audio playback.
+**Why this matters**: ScriptProcessorNode must be connected to something to stay active and process audio. Connecting to a muted gain node (gain=0) keeps it alive without creating audio feedback or hearing your own voice.
 
 ---
 

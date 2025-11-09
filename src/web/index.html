@@ -64,7 +64,7 @@ const muteBtn = document.getElementById('mute');
 const volumeSlider = document.getElementById('volume');
 const volumeValue = document.getElementById('volumeValue');
 
-let ws = null, media = null, ctx = null, proc = null, gain = null;
+let ws = null, media = null, ctx = null, proc = null, gain = null, silentGain = null;
 let scheduleTime = 0; // Gapless timeline
 let isMuted = false;
 let audioUnlocked = false; // Track if audio context is unlocked
@@ -246,11 +246,17 @@ async function start() {
         
         log(`🎵 AudioContext: ${ctx.state}, ${ctx.sampleRate} Hz`);
         
-        // Create gain node
+        // Create gain node for playback
         gain = ctx.createGain();
         gain.connect(ctx.destination);
         updateVolume();
         log('🎚️ Gain node connected to destination');
+        
+        // Create silent gain node for microphone processor (keeps it alive without feedback)
+        silentGain = ctx.createGain();
+        silentGain.gain.value = 0; // Completely silent
+        silentGain.connect(ctx.destination);
+        log('🔇 Silent gain node created for mic processor');
         
         // Initialize gapless timeline
         scheduleTime = ctx.currentTime;
@@ -346,10 +352,10 @@ async function start() {
             }
         };
         
-        // CRITICAL FIX: Do NOT connect input processor to destination!
-        // This was causing feedback and blocking playback
+        // CRITICAL FIX: Connect processor to silent gain (not directly to speakers)
+        // This keeps the processor alive without creating audio feedback
         source.connect(proc);
-        // proc.connect(ctx.destination); // REMOVED - input should not play to speakers
+        proc.connect(silentGain); // Connect to silent gain (gain=0) to keep processor active
         
         log('🎵 Audio pipeline ready - speak now!');
         setStatus('🎤 Listening... (speak and pause for response)', 'status-connected');
@@ -370,6 +376,11 @@ function stop() {
         proc.disconnect();
         proc = null;
         log('🔇 Audio processor disconnected');
+    }
+    if (silentGain) {
+        silentGain.disconnect();
+        silentGain = null;
+        log('🔇 Silent gain disconnected');
     }
     if (gain) {
         gain.disconnect();

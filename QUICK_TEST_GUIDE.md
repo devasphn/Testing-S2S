@@ -73,15 +73,17 @@ Cmd + Shift + R   (Mac)
 
 **The Bug**: Line 297 in `index.html` had:
 ```javascript
-proc.connect(ctx.destination); // ❌ WRONG
+proc.connect(ctx.destination); // ❌ WRONG - creates feedback
 ```
 
-**The Fix**: This line is now removed (commented out):
+**The Fix**: Connect to silent gain node instead:
 ```javascript
-// proc.connect(ctx.destination); // ✅ REMOVED
+silentGain = ctx.createGain();
+silentGain.gain.value = 0;
+proc.connect(silentGain); // ✅ CORRECT - keeps processor alive, no feedback
 ```
 
-This prevented microphone feedback from blocking audio playback.
+This keeps the microphone processor active while preventing audio feedback.
 
 ---
 
