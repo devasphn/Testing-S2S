@@ -114,23 +114,43 @@ class StreamingProcessor:
     async def _process_stream_mode(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
         if not vad_result["is_voice"]:
             return None
-        with torch.no_grad():
-            ids = self.tok.tokenize(chunk.unsqueeze(0).to(self.device))
-        self.user_hist.append(ids)
-        user_ctx = self._context(self.user_hist, 8)
-        with torch.no_grad():
-            # Increased from 4 to 32 tokens to generate audible speech (~0.8s chunks)
-            new_ids = self.model.generate_streaming(user_ctx, max_new_tokens=32, temperature=0.95)
-            self.ai_hist.append(new_ids)
-            out_audio = self.tok.detokenize(new_ids)
         
-        # Debug: Check audio amplitude
+        # TEMPORARY FIX: Generate audible test tone since models are untrained
+        # This proves the audio pipeline works end-to-end
+        # TODO: Replace with trained model inference
+        
+        print("[STREAM DEBUG] ⚠️ Using TEST AUDIO (models are untrained)")
+        
+        # Generate 0.5 second test tone at 440Hz (A note)
+        sample_rate = 24000
+        duration = 0.5
+        num_samples = int(sample_rate * duration)
+        
+        # Create sine wave
+        t = torch.linspace(0, duration, num_samples, device=self.device)
+        frequency = 440.0  # A note
+        amplitude = 0.3  # 30% volume
+        
+        # Add some variation based on input to make it responsive
+        # Use chunk amplitude to modulate frequency
+        chunk_energy = chunk.abs().mean().item()
+        frequency = 440.0 + (chunk_energy * 200.0)  # Vary pitch with input volume
+        
+        out_audio = amplitude * torch.sin(2 * torch.pi * frequency * t)
+        
+        # Add envelope for smooth start/end
+        envelope_len = int(sample_rate * 0.05)  # 50ms fade
+        envelope = torch.ones_like(out_audio)
+        envelope[:envelope_len] = torch.linspace(0, 1, envelope_len, device=self.device)
+        envelope[-envelope_len:] = torch.linspace(1, 0, envelope_len, device=self.device)
+        out_audio = out_audio * envelope
+        
         audio_max = out_audio.abs().max().item()
         audio_mean = out_audio.abs().mean().item()
-        print(f"[STREAM DEBUG] Generated {out_audio.shape[0]} samples | max={audio_max:.4f} mean={audio_mean:.4f}")
+        print(f"[STREAM DEBUG] Generated TEST TONE: {num_samples} samples | {frequency:.0f}Hz | max={audio_max:.4f} mean={audio_mean:.4f}")
         
         self.lat_hist.append((time.time() - t0) * 1000.0)
-        return out_audio.squeeze(0)
+        return out_audio
 
     async def _process_turn_mode(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
         if self.generating_response:
