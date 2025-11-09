@@ -68,6 +68,9 @@ let ws = null, media = null, ctx = null, proc = null, gain = null, silentGain = 
 let scheduleTime = 0; // Gapless timeline
 let isMuted = false;
 let audioUnlocked = false; // Track if audio context is unlocked
+let framesReceived = 0; // Track received frames
+let framesPlayed = 0; // Track played frames
+let playbackErrors = 0; // Track playback errors
 
 // Auto-detect WebSocket URL
 function detectWebSocketUrl() {
@@ -172,16 +175,31 @@ async function unlockAudioContext() {
 
 // Play audio frame with gapless scheduling and improved error handling
 function playAudioFrame(audioData) {
+    framesReceived++;
+    
     if (!ctx || !gain) {
-        log('❌ Cannot play: AudioContext or gain not initialized');
+        log(`❌ Cannot play frame ${framesReceived}: AudioContext or gain not initialized`);
+        playbackErrors++;
         return;
     }
     
-    // Auto-resume if suspended
+    // Check AudioContext state
     if (ctx.state === 'suspended') {
+        log(`⚠️ AudioContext SUSPENDED at frame ${framesReceived} - attempting resume...`);
         ctx.resume().then(() => {
-            log('🔄 Auto-resumed AudioContext for playback');
+            log('🔄 AudioContext resumed successfully');
+            playAudioFrame(audioData); // Retry playback
+        }).catch(err => {
+            log(`❌ Failed to resume AudioContext: ${err.message}`);
+            playbackErrors++;
         });
+        return;
+    }
+    
+    if (ctx.state === 'closed') {
+        log(`❌ AudioContext is CLOSED - cannot play frame ${framesReceived}`);
+        playbackErrors++;
+        return;
     }
     
     try {
@@ -192,20 +210,38 @@ function playAudioFrame(audioData) {
             f32[i] = i16[i] / 32768.0;
         }
         
+        // Check for valid audio data
+        let hasAudio = false;
+        for (let i = 0; i < f32.length; i++) {
+            if (Math.abs(f32[i]) > 0.001) {
+                hasAudio = true;
+                break;
+            }
+        }
+        
         // Create audio buffer
         const buffer = ctx.createBuffer(1, f32.length, 24000);
         buffer.getChannelData(0).set(f32);
         
         // Gapless scheduling with better timing
         const now = ctx.currentTime;
-        if (scheduleTime < now + 0.05) { // Tighter lookahead for better sync
-            scheduleTime = now + 0.05; // Small buffer to prevent underruns
+        if (scheduleTime < now + 0.05) {
+            scheduleTime = now + 0.05;
         }
         
         // Create source and schedule
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(gain);
+        
+        // Add event handlers for debugging
+        source.onended = () => {
+            framesPlayed++;
+            if (framesPlayed % 10 === 0) {
+                log(`✅ Played ${framesPlayed}/${framesReceived} frames (${((framesPlayed/framesReceived)*100).toFixed(0)}%)`);
+            }
+        };
+        
         source.start(scheduleTime);
         
         // Advance timeline
@@ -214,10 +250,16 @@ function playAudioFrame(audioData) {
         
         const durationMs = (duration * 1000).toFixed(1);
         const queueAhead = ((scheduleTime - now) * 1000).toFixed(0);
-        log(`🔊 Playing: ${i16.length} samples (${durationMs}ms) scheduled at +${queueAhead}ms | ctx=${ctx.state}`);
+        const gainValue = gain.gain.value.toFixed(2);
+        
+        // Log every 10th frame to avoid spam
+        if (framesReceived % 10 === 0) {
+            log(`🔊 RX:${framesReceived} ${i16.length}smp (${durationMs}ms) +${queueAhead}ms | ctx=${ctx.state} gain=${gainValue} audio=${hasAudio?'YES':'silent'}`);
+        }
         
     } catch (e) {
-        log(`❌ Playback error: ${e.message}`);
+        playbackErrors++;
+        log(`❌ Playback error #${playbackErrors} at frame ${framesReceived}: ${e.message}`);
         console.error('Audio playback error:', e);
     }
 }
@@ -301,16 +343,16 @@ async function start() {
                 return;
             }
             
-            // Ensure AudioContext is running before playback
-            if (ctx.state === 'suspended') {
-                ctx.resume().then(() => {
-                    log('🔄 Auto-resumed for incoming audio');
-                    playAudioFrame(ev.data);
-                });
-            } else {
-                // Play received audio frame
-                playAudioFrame(ev.data);
+            // First frame debug
+            if (framesReceived === 0) {
+                log(`📥 First audio frame received! Size: ${ev.data.byteLength} bytes`);
+                log(`🔊 AudioContext state: ${ctx.state}`);
+                log(`🎚️ Gain value: ${gain.gain.value}`);
+                log(`🔇 Muted: ${isMuted}`);
             }
+            
+            // Play received audio frame
+            playAudioFrame(ev.data);
         };
         
         // Setup microphone
@@ -406,7 +448,16 @@ function stop() {
     }
     
     scheduleTime = 0;
-    audioUnlocked = false; // Reset for next session
+    audioUnlocked = false;
+    
+    // Log session stats
+    if (framesReceived > 0) {
+        log(`📊 Session stats: Received ${framesReceived} frames, Played ${framesPlayed}, Errors ${playbackErrors}`);
+    }
+    framesReceived = 0;
+    framesPlayed = 0;
+    playbackErrors = 0;
+    
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('Stopped', 'status-idle');
