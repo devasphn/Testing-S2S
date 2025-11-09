@@ -39,13 +39,14 @@
         <button id="start" class="btn-start">🎤 Start Audio</button>
         <button id="stop" class="btn-stop" disabled>⏹️ Stop</button>
         <button id="mute" class="btn-mute">🔊 Mute</button>
+        <button id="testSound" class="btn-start">🔔 Test Sound</button>
         <div class="volume-control">
           <label>Volume:</label>
           <input id="volume" type="range" min="0" max="100" value="90" />
           <span id="volumeValue">90%</span>
         </div>
       </div>
-      <small>📝 <strong>Instructions:</strong> Click Start, allow microphone, speak and pause to hear AI response.</small>
+      <small>📝 <strong>Instructions:</strong> First click "Test Sound" to verify audio. Then Start, allow microphone, speak.</small>
     </div>
     
     <div class="row">
@@ -61,6 +62,7 @@ const wsUrlEl = document.getElementById('wsUrl');
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
 const muteBtn = document.getElementById('mute');
+const testSoundBtn = document.getElementById('testSound');
 const volumeSlider = document.getElementById('volume');
 const volumeValue = document.getElementById('volumeValue');
 
@@ -137,11 +139,13 @@ async function unlockAudioContext() {
             log('🔄 AudioContext resumed before unlock');
         }
         
-        // Create a tiny 440Hz sine wave (0.15s) at audible but low volume
-        const unlockBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
+        // Create a LOUD 440Hz sine wave (0.3s) to test audio output
+        const unlockBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.3, ctx.sampleRate);
         const data = unlockBuffer.getChannelData(0);
         for (let i = 0; i < data.length; i++) {
-            data[i] = Math.sin(2 * Math.PI * 440 * i / ctx.sampleRate) * 0.1; // Slightly louder
+            // Loud beep that fades out
+            const envelope = 1.0 - (i / data.length);
+            data[i] = Math.sin(2 * Math.PI * 440 * i / ctx.sampleRate) * 0.3 * envelope;
         }
         
         const unlockSource = ctx.createBufferSource();
@@ -463,9 +467,64 @@ function stop() {
     setStatus('Stopped', 'status-idle');
 }
 
+// Test sound function - plays a loud beep to verify audio output
+async function playTestSound() {
+    try {
+        log('🔔 Playing test sound...');
+        
+        // Create temporary AudioContext if needed
+        const testCtx = ctx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        
+        if (testCtx.state === 'suspended') {
+            await testCtx.resume();
+            log('🔄 Resumed AudioContext for test');
+        }
+        
+        // Create temporary gain
+        const testGain = testCtx.createGain();
+        testGain.gain.value = 0.5; // 50% volume for test
+        testGain.connect(testCtx.destination);
+        
+        // Create 1 second beep at 440Hz (A note)
+        const duration = 1.0;
+        const freq = 440;
+        const testBuffer = testCtx.createBuffer(1, testCtx.sampleRate * duration, testCtx.sampleRate);
+        const data = testBuffer.getChannelData(0);
+        
+        for (let i = 0; i < data.length; i++) {
+            // Beep with fade in/out envelope
+            const t = i / data.length;
+            let envelope = 1.0;
+            if (t < 0.1) envelope = t / 0.1; // Fade in
+            if (t > 0.9) envelope = (1.0 - t) / 0.1; // Fade out
+            data[i] = Math.sin(2 * Math.PI * freq * i / testCtx.sampleRate) * 0.5 * envelope;
+        }
+        
+        const testSource = testCtx.createBufferSource();
+        testSource.buffer = testBuffer;
+        testSource.connect(testGain);
+        testSource.start(0);
+        
+        log(`🔊 TEST BEEP PLAYING NOW! If you hear it, your audio works!`);
+        log(`🎵 Frequency: ${freq}Hz, Duration: ${duration}s, Volume: 50%`);
+        
+        testSource.onended = () => {
+            log('✅ Test sound finished. Did you hear it?');
+            if (!ctx) {
+                testCtx.close();
+            }
+        };
+        
+    } catch (err) {
+        log(`❌ Test sound failed: ${err.message}`);
+        console.error('Test sound error:', err);
+    }
+}
+
 startBtn.onclick = start;
 stopBtn.onclick = stop;
 muteBtn.onclick = toggleMute;
+testSoundBtn.onclick = playTestSound;
 volumeSlider.oninput = updateVolume;
 
 // Auto-resume on tab focus
