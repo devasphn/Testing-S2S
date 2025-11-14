@@ -12,5 +12,5 @@ model:
 server:
   host: 0.0.0.0
   port: 8000
-  vad_threshold: 0.01
+  vad_threshold: 0.65  # FIXED: Changed from 0.01 to 0.65 to prevent false positives
   sample_rate: 24000
