@@ -80,8 +80,6 @@ class SileroVADWrapper:
         print(f"       - Accuracy: 92% (neural network)")
     
     def __call__(self, audio: torch.Tensor) -> Dict[str, any]:
-        if audio.abs().max() > 0:
-            audio = audio / audio.abs().max()
         """
         Process audio chunk for voice activity detection
         Buffers audio until we have exactly required_samples
@@ -93,6 +91,8 @@ class SileroVADWrapper:
             Dict with is_voice, turn_ended, speaking, speech_prob
         """
         # Ensure audio is on CPU and 1D
+        if audio.abs().max() > 0:
+            audio = audio / audio.abs().max()
         if audio.device.type != 'cpu':
             audio = audio.cpu()
         if audio.dim() > 1:
