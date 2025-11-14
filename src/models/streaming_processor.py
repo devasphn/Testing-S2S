@@ -2,7 +2,7 @@
 """
 Streaming Processor - Production Version with Silero VAD
 Updated: November 14, 2025
-Changes: Replaced custom energy-based VAD with Silero neural network VAD (92% accuracy)
+Fix: Silero VAD sample size requirement (512 samples at 16kHz)
 """
 from collections import deque
 from typing import Optional, Dict, List
@@ -10,12 +10,12 @@ import time
 import os
 import torch
 import torch.nn as nn
+import torchaudio
 
 # Try to import Silero VAD
 try:
     import torch
     import torchaudio
-    # Silero VAD will be loaded dynamically
     SILERO_AVAILABLE = True
 except ImportError:
     print("[WARNING] Silero VAD dependencies not fully available")
@@ -26,7 +26,7 @@ except ImportError:
 class SileroVADWrapper:
     """
     Production-grade Voice Activity Detection using Silero neural network
-    Provides 92% accuracy vs 70% from simple energy-based detection
+    Handles proper sample size requirements (512 samples @ 16kHz)
     """
     def __init__(self, 
                  threshold: float = 0.5,
@@ -37,10 +37,8 @@ class SileroVADWrapper:
         
         Args:
             threshold: Speech probability threshold (0.0-1.0)
-                      0.5 is balanced, 0.7 is conservative
             silence_frames: Frames of silence before turn ends
-                           30 @ 80ms = 2.4 seconds
-            sample_rate: Audio sample rate (Silero supports 8000/16000)
+            sample_rate: Target sample rate for Silero (16000 or 8000)
         """
         if not SILERO_AVAILABLE:
             raise ImportError("Silero VAD not available. Install: pip install silero-vad")
@@ -63,6 +61,12 @@ class SileroVADWrapper:
         self.silence_frames = silence_frames
         self.sample_rate = sample_rate
         
+        # Silero expects exactly 512 samples for 16kHz, 256 for 8kHz
+        self.required_samples = 512 if sample_rate == 16000 else 256
+        
+        # Buffer for accumulating samples
+        self.audio_buffer = torch.empty(0, dtype=torch.float32)
+        
         # State tracking
         self.silence_count = 0
         self.speaking = False
@@ -72,74 +76,100 @@ class SileroVADWrapper:
         print(f"       - Threshold: {threshold}")
         print(f"       - Silence frames: {silence_frames} (~{silence_frames * 0.08:.1f}s)")
         print(f"       - Sample rate: {sample_rate} Hz")
+        print(f"       - Required samples: {self.required_samples}")
         print(f"       - Accuracy: 92% (neural network)")
     
     def __call__(self, audio: torch.Tensor) -> Dict[str, any]:
         """
         Process audio chunk for voice activity detection
+        Buffers audio until we have exactly required_samples
         
         Args:
-            audio: Audio tensor [num_samples] at target sample rate
+            audio: Audio tensor [num_samples] at original sample rate
         
         Returns:
             Dict with is_voice, turn_ended, speaking, speech_prob
         """
-        # Ensure audio is on CPU (Silero runs on CPU for low latency)
+        # Ensure audio is on CPU and 1D
         if audio.device.type != 'cpu':
             audio = audio.cpu()
-        
-        # Ensure audio is 1D
         if audio.dim() > 1:
             audio = audio.squeeze()
         
-        # Resample if needed (Silero expects 16kHz or 8kHz)
+        # Resample to Silero's expected sample rate if needed
         if hasattr(self, 'original_sr') and self.original_sr != self.sample_rate:
-            # Simple downsampling (for 24kHz -> 16kHz)
-            if self.original_sr == 24000 and self.sample_rate == 16000:
-                audio = audio[::3][:int(len(audio) * 16000 / 24000)]
+            # Use torchaudio for proper resampling
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=self.original_sr,
+                new_freq=self.sample_rate
+            )
+            audio = resampler(audio)
         
-        # Get speech probability from Silero
-        with torch.no_grad():
-            speech_prob = self.model(audio, self.sample_rate).item()
+        # Add to buffer
+        self.audio_buffer = torch.cat([self.audio_buffer, audio])
         
-        # Smooth with recent history
-        self.speech_probs.append(speech_prob)
-        avg_prob = sum(self.speech_probs) / len(self.speech_probs)
-        
-        # Voice detection decision
-        is_voice = avg_prob > self.threshold
-        
-        # Update speaking state
-        if is_voice:
-            self.silence_count = 0
-            self.speaking = True
+        # Process if we have enough samples
+        if len(self.audio_buffer) >= self.required_samples:
+            # Take exactly required_samples
+            chunk_for_vad = self.audio_buffer[:self.required_samples]
+            
+            # Remove processed samples from buffer (keep overlap for continuity)
+            overlap = self.required_samples // 4  # 25% overlap
+            self.audio_buffer = self.audio_buffer[self.required_samples - overlap:]
+            
+            # Get speech probability from Silero
+            with torch.no_grad():
+                speech_prob = self.model(chunk_for_vad, self.sample_rate).item()
+            
+            # Smooth with recent history
+            self.speech_probs.append(speech_prob)
+            avg_prob = sum(self.speech_probs) / len(self.speech_probs)
+            
+            # Voice detection decision
+            is_voice = avg_prob > self.threshold
+            
+            # Update speaking state
+            if is_voice:
+                self.silence_count = 0
+                self.speaking = True
+            else:
+                self.silence_count += 1
+            
+            # Turn end detection
+            turn_ended = self.speaking and self.silence_count >= self.silence_frames
+            
+            if turn_ended:
+                self.speaking = False
+                self.silence_count = 0
+            
+            return {
+                "is_voice": is_voice,
+                "turn_ended": turn_ended,
+                "speaking": self.speaking,
+                "speech_prob": speech_prob,
+                "avg_prob": avg_prob
+            }
         else:
-            self.silence_count += 1
-        
-        # Turn end detection
-        turn_ended = self.speaking and self.silence_count >= self.silence_frames
-        
-        if turn_ended:
-            self.speaking = False
-            self.silence_count = 0
-        
-        return {
-            "is_voice": is_voice,
-            "turn_ended": turn_ended,
-            "speaking": self.speaking,
-            "speech_prob": speech_prob,
-            "avg_prob": avg_prob
-        }
+            # Not enough samples yet, return current state
+            return {
+                "is_voice": self.speaking,  # Maintain previous state
+                "turn_ended": False,
+                "speaking": self.speaking,
+                "speech_prob": self.speech_probs[-1] if self.speech_probs else 0.0,
+                "avg_prob": sum(self.speech_probs) / len(self.speech_probs) if self.speech_probs else 0.0
+            }
     
     def set_sample_rate(self, original_sr: int):
         """Set original sample rate for resampling"""
         self.original_sr = original_sr
+        print(f"[INFO] VAD will resample from {original_sr}Hz to {self.sample_rate}Hz")
     
     def reset(self):
         """Reset VAD state"""
         self.silence_count = 0
         self.speaking = False
         self.speech_probs.clear()
+        self.audio_buffer = torch.empty(0, dtype=torch.float32)
 
 
 class Chunker:
