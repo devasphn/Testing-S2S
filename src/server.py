@@ -102,7 +102,7 @@ async def startup():
         chunk_size_ms=80,
         sample_rate=TRANSPORT_SR,
         max_latency_ms=200,
-        vad_threshold=0.001,  # lower threshold to detect speech more easily
+        vad_threshold=0.65,  # FIXED: Changed from 0.001 to 0.65 to prevent always-on audio
         reply_mode=REPLY_MODE
     )
     # Warmup once to reduce first-turn latency/plan selection
