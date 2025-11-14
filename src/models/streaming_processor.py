@@ -29,8 +29,8 @@ class SileroVADWrapper:
     Handles proper sample size requirements (512 samples @ 16kHz)
     """
     def __init__(self, 
-                 threshold: float = 0.5,
-                 silence_frames: int = 30,
+                 threshold: float = 0.65,
+                 silence_frames: int = 5,
                  sample_rate: int = 16000):
         """
         Initialize Silero VAD wrapper
@@ -70,7 +70,7 @@ class SileroVADWrapper:
         # State tracking
         self.silence_count = 0
         self.speaking = False
-        self.speech_probs = deque(maxlen=10)  # Smoothing buffer
+        self.speech_probs = deque(maxlen=3)  # Smoothing buffer
         
         print(f"[INFO] Silero VAD initialized:")
         print(f"       - Threshold: {threshold}")
@@ -80,6 +80,8 @@ class SileroVADWrapper:
         print(f"       - Accuracy: 92% (neural network)")
     
     def __call__(self, audio: torch.Tensor) -> Dict[str, any]:
+        if audio.abs().max() > 0:
+            audio = audio / audio.abs().max()
         """
         Process audio chunk for voice activity detection
         Buffers audio until we have exactly required_samples
@@ -139,6 +141,7 @@ class SileroVADWrapper:
             turn_ended = self.speaking and self.silence_count >= self.silence_frames
             
             if turn_ended:
+                self.speech_probs.clear()
                 self.speaking = False
                 self.silence_count = 0
             
