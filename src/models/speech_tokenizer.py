@@ -11,11 +11,12 @@ import librosa
 from .hifigan_public import PublicHiFiGANVocoder
 
 class SpeechTokenizer(nn.Module):
-    def __init__(self, n_mels: int = 80, sample_rate: int = 24000, hop_ms: int = 80, codebook_size: int = 1024, hidden: int = 256):
+    def __init__(self, n_mels: int = 80, sample_rate: int = 22050, hop_ms: int = 80, codebook_size: int = 1024, hidden: int = 256):
         super().__init__()
         self.n_mels = n_mels
         self.sr = sample_rate
         self.hop = int(sample_rate * hop_ms / 1000)
+        self.vocoder_sample_rate = self.sr
         self.codebook_size = codebook_size
         self.hidden = hidden
 

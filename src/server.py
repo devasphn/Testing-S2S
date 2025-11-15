@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import torch
+import torchaudio.functional as AF
 import numpy as np
 import traceback
 import os
@@ -56,22 +57,22 @@ FRAME_PACING_SEC = FRAME_MS / 1000.0
 active_connections = set()
 
 # Resampling helper (22.05 kHz -> 24 kHz)
-def _resample_linear(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
+def _resample_hq(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
     if src_sr == dst_sr:
         return wav
-    wav = wav.detach().cpu().contiguous().view(-1)
-    n = wav.numel()
-    if n <= 1:
-        m = max(1, int(round(dst_sr / max(1, src_sr))))
-        return torch.zeros(m, dtype=wav.dtype)
-    dur = n / float(src_sr)
-    m = max(1, int(round(dur * dst_sr)))
-    x = torch.linspace(0, n - 1, steps=m)
-    x0 = torch.clamp(x.floor().long(), 0, n - 2)
-    x1 = x0 + 1
-    frac = (x - x0.float())
-    y = wav[x0] * (1.0 - frac) + wav[x1] * frac
-    return y
+    wav = wav.detach().cpu()
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    resampled = AF.resample(
+        wav,
+        orig_freq=src_sr,
+        new_freq=dst_sr,
+        lowpass_filter_width=64,
+        rolloff=0.99,
+        resampling_method="sinc_interp_kaiser",
+        beta=14.769656459379492,
+    )
+    return resampled.squeeze(0)
 
 # Soft limiter to avoid clipping
 def _limit(x: torch.Tensor, thresh: float = 0.98) -> torch.Tensor:
