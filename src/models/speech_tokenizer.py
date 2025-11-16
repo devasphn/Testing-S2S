@@ -50,7 +50,7 @@ class SpeechTokenizer(nn.Module):
             mel = librosa.power_to_db(mel, ref=np.max)
             mel = (mel + 80.0) / 80.0
             mels.append(torch.tensor(mel, dtype=torch.float32))
-        mel = torch.stack(mels).to(audio.device)
+        mel = torch.stack(mels)
         return mel
 
     def mel_to_audio(self, mel: torch.Tensor) -> torch.Tensor:
@@ -58,6 +58,8 @@ class SpeechTokenizer(nn.Module):
 
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
         mel = self.audio_to_mel(audio)
+        device = self.codebook.device
+        mel = mel.to(device)
         h = self.enc(mel)
         h = h.transpose(1, 2)
         h = self.enc_tf(h)
