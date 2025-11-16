@@ -53,8 +53,36 @@ FRAME_MS = 20  # 20ms frames (480 samples @ 24k)
 FRAME_SAMPLES = int(TRANSPORT_SR * FRAME_MS / 1000)
 FRAME_PACING_SEC = FRAME_MS / 1000.0
 
+# Checkpoint paths
+TOKENIZER_CKPT = os.getenv("TOKENIZER_CKPT", "checkpoints/tokenizer/speech_tokenizer_telugu_epoch0200.pth")
+MODEL_CKPT = os.getenv("HYBRID_S2S_CKPT", "checkpoints/hybrid_s2s/hybrid_s2s_telugu.pth")
+SPEAKER_EMB = os.getenv("SPEAKER_EMB", "data/speaker/speaker_embedding.pt")
+
 # Connection tracking
 active_connections = set()
+
+
+def _load_state_dict(module: torch.nn.Module, path: str, key: str = "state_dict"):
+    if not path or not os.path.exists(path):
+        print(f"[WARN] Checkpoint not found at {path} - using randomly initialized {module.__class__.__name__}")
+        return
+    ckpt = torch.load(path, map_location=_device)
+    state = ckpt[key] if isinstance(ckpt, dict) and key in ckpt else ckpt
+    module.load_state_dict(state)
+    print(f"[INFO] Loaded {module.__class__.__name__} weights from {path}")
+
+
+def _load_speaker_embedding(path: str) -> Optional[torch.Tensor]:
+    if not path or not os.path.exists(path):
+        print(f"[WARN] Speaker embedding not found at {path}; using default gain")
+        return None
+    data = torch.load(path, map_location="cpu")
+    emb = data.get("embedding")
+    if emb is None:
+        print(f"[WARN] Speaker embedding file {path} missing 'embedding' key")
+        return None
+    print(f"[INFO] Loaded speaker embedding from {path} (backend={data.get('encoder_backend', 'unknown')})")
+    return emb
 
 # Resampling helper (22.05 kHz -> 24 kHz)
 def _resample_hq(wav: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
@@ -96,7 +124,11 @@ async def startup():
     global _model, _tok, _proc
     print(f"[INFO] Starting server on device: {_device} with REPLY_MODE={REPLY_MODE}")
     _tok = SpeechTokenizer().to(_device)
-    _model = HybridS2SModel().to(_device).eval()
+    _load_state_dict(_tok, TOKENIZER_CKPT)
+    _model = HybridS2SModel().to(_device)
+    _load_state_dict(_model, MODEL_CKPT)
+    _model.eval()
+    speaker_embedding = _load_speaker_embedding(SPEAKER_EMB)
     _proc = StreamingProcessor(
         model=_model,
         speech_tokenizer=_tok,
@@ -104,7 +136,8 @@ async def startup():
         sample_rate=TRANSPORT_SR,
         max_latency_ms=200,
         vad_threshold=0.65,  # FIXED: Changed from 0.001 to 0.65 to prevent always-on audio
-        reply_mode=REPLY_MODE
+        reply_mode=REPLY_MODE,
+        speaker_embedding=speaker_embedding
     )
     # Warmup once to reduce first-turn latency/plan selection
     await _warmup_pipeline()

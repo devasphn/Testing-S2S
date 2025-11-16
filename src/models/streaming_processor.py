@@ -11,6 +11,7 @@ import os
 import torch
 import torch.nn as nn
 import torchaudio
+import torchaudio.functional as AF
 
 # Try to import Silero VAD
 try:
@@ -218,7 +219,10 @@ class StreamingProcessor:
                  sample_rate: int = 24000,
                  max_latency_ms: int = 200, 
                  vad_threshold: float = 0.5,
-                 reply_mode: str = "stream"):
+                 reply_mode: str = "stream",
+                 max_stream_tokens: int = 6,
+                 max_turn_tokens: int = 160,
+                 speaker_embedding: Optional[torch.Tensor] = None):
         self.model = model
         self.tok = speech_tokenizer
         self.device = next(model.parameters()).device
@@ -256,6 +260,48 @@ class StreamingProcessor:
         print(f"       - Sample rate: {sample_rate} Hz")
         print(f"       - VAD: Silero (neural network, 92% accurate)")
 
+    def _resample_audio(self, audio: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
+        if src_sr == dst_sr:
+            return audio
+        needs_squeeze = False
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+            needs_squeeze = True
+        audio = AF.resample(
+            audio,
+            orig_freq=src_sr,
+            new_freq=dst_sr,
+            lowpass_filter_width=64,
+            rolloff=0.99,
+            resampling_method="sinc_interp_kaiser",
+            beta=14.769656459379492,
+        )
+        if needs_squeeze:
+            audio = audio.squeeze(0)
+        return audio
+
+    def _chunk_to_tokens(self, chunk: torch.Tensor) -> Optional[torch.Tensor]:
+        if chunk.numel() == 0:
+            return None
+        audio_cpu = chunk.detach().cpu()
+        audio_cpu = self._resample_audio(audio_cpu, self.transport_sr, self.tokenizer_sr)
+        audio_cpu = audio_cpu.unsqueeze(0)
+        with torch.no_grad():
+            tokens = self.tok.tokenize(audio_cpu)
+        if tokens is None or tokens.numel() == 0:
+            return None
+        return tokens.to(self.device)
+
+    def _tokens_to_audio(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)
+        with torch.no_grad():
+            audio = self.tok.detokenize(token_ids.to(self.device)).squeeze(0)
+        audio = self._resample_audio(audio, self.vocoder_sr, self.transport_sr)
+        audio = audio * self.speaker_gain
+        audio = torch.tanh(audio / 0.98) * 0.98
+        return audio.to(self.device)
+
     async def process_audio_stream(self, audio: torch.Tensor) -> Optional[torch.Tensor]:
         t0 = time.time()
         if audio.dim() > 1:
@@ -277,31 +323,15 @@ class StreamingProcessor:
     async def _process_stream_mode(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
         if not vad_result["is_voice"]:
             return None
-        
-        # TEMPORARY: Test tone generation (models not trained yet)
-        speech_prob = vad_result.get("speech_prob", 0.0)
-        print(f"[STREAM] ⚠️ TEST AUDIO | Speech prob: {speech_prob:.2f}")
-        
-        # Generate test tone
-        sample_rate = 24000
-        duration = 0.5
-        num_samples = int(sample_rate * duration)
-        
-        t = torch.linspace(0, duration, num_samples, device=self.device)
-        frequency = 440.0 + (speech_prob * 200.0)
-        amplitude = 0.3
-        
-        out_audio = amplitude * torch.sin(2 * torch.pi * frequency * t)
-        
-        # Envelope
-        envelope_len = int(sample_rate * 0.05)
-        envelope = torch.ones_like(out_audio)
-        envelope[:envelope_len] = torch.linspace(0, 1, envelope_len, device=self.device)
-        envelope[-envelope_len:] = torch.linspace(1, 0, envelope_len, device=self.device)
-        out_audio = out_audio * envelope
-        
-        print(f"[STREAM] Generated: {num_samples} samples | {frequency:.0f}Hz")
-        
+
+        tokens = self._chunk_to_tokens(chunk)
+        if tokens is None:
+            return None
+
+        with torch.no_grad():
+            gen_ids = self.model.generate_streaming(tokens, max_new_tokens=self.max_stream_tokens)
+        out_audio = self._tokens_to_audio(gen_ids)
+
         self.lat_hist.append((time.time() - t0) * 1000.0)
         return out_audio
 
@@ -310,9 +340,9 @@ class StreamingProcessor:
             return None
         
         if vad_result["is_voice"] and vad_result["speaking"]:
-            with torch.no_grad():
-                ids = self.tok.tokenize(chunk.unsqueeze(0).to(self.device))
-            self.turn_buffer.append(ids)
+            tokens = self._chunk_to_tokens(chunk)
+            if tokens is not None:
+                self.turn_buffer.append(tokens)
             
             speech_prob = vad_result.get("speech_prob", 0.0)
             print(f"[USER] Turn collecting: chunks={len(self.turn_buffer)} | Speech: {speech_prob:.2f}")
@@ -324,34 +354,17 @@ class StreamingProcessor:
             print(f"[USER] Turn ended: {len(self.turn_buffer)} chunks | Avg: {avg_prob:.2f} → generating")
             self.generating_response = True
             try:
-                # TEMPORARY: Test tone generation
-                print("[TURN] ⚠️ TEST AUDIO")
-                
-                sample_rate = 24000
-                duration = 1.5
-                num_samples = int(sample_rate * duration)
-                
-                t = torch.linspace(0, duration, num_samples, device=self.device)
-                base_freq = 440.0 + (len(self.turn_buffer) * 10.0)
-                freq_variation = torch.sin(2 * torch.pi * 2.0 * t) * 50.0
-                frequencies = base_freq + freq_variation
-                
-                phase = torch.cumsum(2 * torch.pi * frequencies / sample_rate, dim=0)
-                amplitude = 0.3
-                out_audio = amplitude * torch.sin(phase)
-                
-                # Envelope
-                envelope_len = int(sample_rate * 0.1)
-                envelope = torch.ones_like(out_audio)
-                envelope[:envelope_len] = torch.linspace(0, 1, envelope_len, device=self.device)
-                envelope[-envelope_len:] = torch.linspace(1, 0, envelope_len, device=self.device)
-                out_audio = out_audio * envelope
-                
-                print(f"[TURN] Generated: {num_samples} samples | {base_freq:.0f}Hz")
-                
+                user_tokens = torch.cat(self.turn_buffer, dim=1)
+                with torch.no_grad():
+                    gen_ids = self.model.generate_streaming(
+                        user_tokens,
+                        max_new_tokens=self.max_turn_tokens,
+                    )
+                out_audio = self._tokens_to_audio(gen_ids)
+
                 latency_ms = (time.time() - t0) * 1000.0
                 self.lat_hist.append(latency_ms)
-                
+
                 return out_audio
             finally:
                 self.turn_buffer.clear()
