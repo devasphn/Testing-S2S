@@ -237,11 +237,17 @@ class StreamingProcessor:
         silence_frames = 30 if self.reply_mode == "turn" else 5
 
         self.speaker_embedding = None
-        self.speaker_gain = 1.0
+        env_gain = float(os.getenv("SPEAKER_GAIN", "1.0"))
+        self.speaker_gain = max(0.1, min(2.0, env_gain))
         if speaker_embedding is not None:
             self.speaker_embedding = speaker_embedding.detach().clone().to(self.device)
-            mean_val = torch.sigmoid(self.speaker_embedding.float().mean())
-            self.speaker_gain = float(mean_val.item())
+            mean_val = torch.sigmoid(self.speaker_embedding.float().mean()).item()
+            auto_gain = 0.5 + mean_val  # keep within [0.5, 1.5]
+            self.speaker_gain = max(0.1, min(2.0, self.speaker_gain * auto_gain))
+            print(f"[INFO] Speaker embedding gain set to {self.speaker_gain:.3f} (env={env_gain:.2f}, auto={auto_gain:.2f})")
+        else:
+            print(f"[INFO] Speaker gain fixed at {self.speaker_gain:.3f} (no speaker embedding)")
+        self._warned_silence = False
 
         # Initialize Silero VAD
         try:
@@ -312,6 +318,15 @@ class StreamingProcessor:
         audio = self._resample_audio(audio, self.vocoder_sr, self.transport_sr)
         audio = audio * self.speaker_gain
         audio = torch.tanh(audio / 0.98) * 0.98
+
+        peak = float(audio.abs().max().item()) if audio.numel() else 0.0
+        rms = float(audio.pow(2).mean().sqrt().item()) if audio.numel() else 0.0
+        if peak < 1e-3:
+            if not self._warned_silence:
+                print(f"[WARN] Generated audio is near-silent (peak={peak:.6f}, rms={rms:.6f}). Consider increasing SPEAKER_GAIN or inspecting model outputs.")
+                self._warned_silence = True
+        else:
+            self._warned_silence = False
         return audio.to(self.device)
 
     async def process_audio_stream(self, audio: torch.Tensor) -> Optional[torch.Tensor]:
