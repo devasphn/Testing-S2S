@@ -278,8 +278,16 @@ class StreamingProcessor:
 
         self.det_responder = deterministic_responder
         self.deterministic = self.det_responder is not None
+        self.det_energy_floor = float(os.getenv("DETERMINISTIC_ENERGY_FLOOR", "1e-4"))
+        self.det_silence_timeout = float(os.getenv("DETERMINISTIC_SILENCE_TIMEOUT", "0.4"))
+        self._last_voice_ts: Optional[float] = None
         if self.deterministic:
             print(f"[INFO] Deterministic responder enabled with {len(self.det_responder)} QA pairs")
+            if self.det_energy_floor > 0:
+                print(
+                    f"       - Deterministic energy floor: {self.det_energy_floor:.6f}"
+                )
+            print(f"       - Silence timeout: {self.det_silence_timeout:.2f}s")
 
         print(f"[INFO] StreamingProcessor initialized:")
         print(f"       - REPLY_MODE: {self.reply_mode}")
@@ -433,31 +441,53 @@ class StreamingProcessor:
         if not self.det_responder:
             return None
 
-        if vad_result.get("is_voice"):
+        now = time.time()
+        energy = float(chunk.detach().abs().mean().item())
+        is_voice = bool(vad_result.get("is_voice", False))
+        if not is_voice and energy > self.det_energy_floor:
+            is_voice = True
+        turn_ended = bool(vad_result.get("turn_ended", False))
+
+        if is_voice:
             self.turn_audio.append(chunk.detach().cpu())
             self.response_generated = False
+            self._last_voice_ts = now
             return None
 
-        if vad_result.get("turn_ended") and self.turn_audio and not self.response_generated:
+        silence_elapsed = None
+        if self._last_voice_ts is not None:
+            silence_elapsed = now - self._last_voice_ts
+        if (
+            not turn_ended
+            and self.turn_audio
+            and silence_elapsed is not None
+            and silence_elapsed >= self.det_silence_timeout
+        ):
+            turn_ended = True
+
+        if turn_ended and self.turn_audio and not self.response_generated:
             user_audio = torch.cat(self.turn_audio, dim=0)
             self.turn_audio.clear()
             match = self.det_responder.match(user_audio, self.transport_sr)
             if match is None:
                 print("[WARN] Deterministic responder: no match found for latest utterance")
+                self._last_voice_ts = None
                 return None
 
             ai_audio = match["ai_audio"].to(self.device)
             ai_audio = torch.tanh(ai_audio * self.speaker_gain / 0.98) * 0.98
             self.response_generated = True
             self.lat_hist.append((time.time() - t0) * 1000.0)
+            self._last_voice_ts = None
             print(
                 f"[DETERMINISTIC] Matched question '{match.get('id')}' "
                 f"(score={match.get('score', 0.0):.2f}) → streaming '{match.get('ai_file')}'"
             )
             return ai_audio
 
-        if vad_result.get("turn_ended"):
+        if turn_ended:
             self.turn_audio.clear()
+            self._last_voice_ts = None
 
         return None
 
@@ -494,6 +524,7 @@ class StreamingProcessor:
         self.turn_audio.clear()
         self.generating_response = False
         self.response_generated = False
+        self._last_voice_ts = None
         self.chunker.buf = torch.empty(0, device=self.device)
         self.vad.reset()
         print("[INFO] StreamingProcessor state reset")
