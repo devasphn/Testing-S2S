@@ -355,8 +355,17 @@ class StreamingProcessor:
         if tokens is None:
             return None
 
+        self.user_hist.append(tokens)
+        user_ctx = self._context(self.user_hist, L=48)
+        ai_ctx = self._context(self.ai_hist, L=48)
+
         with torch.no_grad():
-            gen_ids = self.model.generate_streaming(tokens, max_new_tokens=self.max_stream_tokens)
+            gen_ids = self.model.generate_streaming(
+                user_ctx,
+                ai_context=ai_ctx,
+                max_new_tokens=self.max_stream_tokens,
+            )
+        self.ai_hist.append(gen_ids.detach())
         out_audio = self._tokens_to_audio(gen_ids)
 
         self.lat_hist.append((time.time() - t0) * 1000.0)
@@ -382,11 +391,16 @@ class StreamingProcessor:
             self.generating_response = True
             try:
                 user_tokens = torch.cat(self.turn_buffer, dim=1)
+                self.user_hist.append(user_tokens)
+                user_ctx = self._context(self.user_hist, L=160)
+                ai_ctx = self._context(self.ai_hist, L=160)
                 with torch.no_grad():
                     gen_ids = self.model.generate_streaming(
-                        user_tokens,
+                        user_ctx,
+                        ai_context=ai_ctx,
                         max_new_tokens=self.max_turn_tokens,
                     )
+                self.ai_hist.append(gen_ids.detach())
                 out_audio = self._tokens_to_audio(gen_ids)
 
                 latency_ms = (time.time() - t0) * 1000.0
