@@ -80,7 +80,5 @@ def main():
 
     total_seconds = sum(sample["audio_seconds"] for sample in dataset["samples"])
     print(f"Saved {len(dataset['samples'])} samples ({total_seconds:.1f}s) to {args.output}")
-
-
-+if __name__ == "__main__":
-+    main()
+if __name__ == "__main__":
+    main()
