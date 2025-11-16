@@ -221,7 +221,7 @@ async def ws_stream(websocket: WebSocket):
                     src_sr = getattr(_tok.vocoder, 'sample_rate', TRANSPORT_SR) if _tok else TRANSPORT_SR
                     out_cpu = out.detach().cpu()
                     if src_sr != TRANSPORT_SR:
-                        out_cpu = _resample_linear(out_cpu, src_sr, TRANSPORT_SR)
+                        out_cpu = _resample_hq(out_cpu, src_sr, TRANSPORT_SR)
                     total_samples = out_cpu.numel()
                     duration = total_samples / TRANSPORT_SR
                     
