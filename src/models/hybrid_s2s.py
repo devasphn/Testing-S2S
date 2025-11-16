@@ -122,22 +122,21 @@ class HybridS2SModel(nn.Module):
 
     def forward(self, user_audio_tokens: torch.Tensor, ai_audio_tokens: torch.Tensor, text_tokens: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         device = user_audio_tokens.device
-        with inference_mode(device):
-            user_h = self._ids_to_hidden(user_audio_tokens)
-            ai_h = self._ids_to_hidden(ai_audio_tokens)
-            depth_out = self.depth(user_h, ai_h)
-            b = user_audio_tokens.size(0)
-            depth_len = depth_out.size(1)
-            speech_pad_ids = torch.full((b, depth_len), self.cfg.vocab_size, device=device, dtype=torch.long)
-            mod_speech = torch.ones_like(speech_pad_ids)
-            if text_tokens is not None:
-                input_ids = torch.cat([speech_pad_ids, text_tokens], dim=1)
-                mod_text = torch.zeros_like(text_tokens)
-                modality = torch.cat([mod_speech, mod_text], dim=1)
-            else:
-                input_ids = speech_pad_ids
-                modality = mod_speech
-            return self.unified(input_ids=input_ids, modality_ids=modality)
+        user_h = self._ids_to_hidden(user_audio_tokens)
+        ai_h = self._ids_to_hidden(ai_audio_tokens)
+        depth_out = self.depth(user_h, ai_h)
+        b = user_audio_tokens.size(0)
+        depth_len = depth_out.size(1)
+        speech_pad_ids = torch.full((b, depth_len), self.cfg.vocab_size, device=device, dtype=torch.long)
+        mod_speech = torch.ones_like(speech_pad_ids)
+        if text_tokens is not None:
+            input_ids = torch.cat([speech_pad_ids, text_tokens], dim=1)
+            mod_text = torch.zeros_like(text_tokens)
+            modality = torch.cat([mod_speech, mod_text], dim=1)
+        else:
+            input_ids = speech_pad_ids
+            modality = mod_speech
+        return self.unified(input_ids=input_ids, modality_ids=modality)
 
     @torch.no_grad()
     def generate_streaming(self, user_audio_chunk_ids: torch.Tensor, max_new_tokens: int = 6, temperature: float = 0.9) -> torch.Tensor:
