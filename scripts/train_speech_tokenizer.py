@@ -38,6 +38,25 @@ def pad_collate(batch):
     return padded
 
 
+def save_checkpoint(path: Path, tokenizer: SpeechTokenizer, optimizer: torch.optim.Optimizer, epoch: int):
+    torch.save(
+        {
+            "epoch": epoch,
+            "state_dict": tokenizer.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        path,
+    )
+
+
+def load_checkpoint(path: Path, tokenizer: SpeechTokenizer, optimizer: torch.optim.Optimizer):
+    ckpt = torch.load(path, map_location=tokenizer.codebook.device)
+    tokenizer.load_state_dict(ckpt["state_dict"])
+    if "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt.get("epoch", 0)
+
+
 def train_tokenizer(
     dataset_path: Path,
     output_dir: Path,
@@ -47,6 +66,9 @@ def train_tokenizer(
     beta: float,
     device: str,
     export_wav: Path | None,
+    resume_from: Path | None,
+    save_every: int,
+    checkpoint_prefix: str,
 ):
     dataset = AudioDataset(dataset_path)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate)
@@ -56,7 +78,12 @@ def train_tokenizer(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, epochs + 1):
+    start_epoch = 1
+    if resume_from and resume_from.exists():
+        start_epoch = load_checkpoint(resume_from, tokenizer, optimizer) + 1
+        print(f"Resumed SpeechTokenizer from {resume_from} (starting epoch {start_epoch})")
+
+    for epoch in range(start_epoch, epochs + 1):
         tokenizer.train()
         total_loss = 0.0
         total_recon = 0.0
@@ -89,9 +116,10 @@ def train_tokenizer(
             f"Recon: {total_recon/steps:.4f} | VQ: {total_vq/steps:.4f}"
         )
 
-    ckpt_path = output_dir / "speech_tokenizer_telugu.pth"
-    torch.save({"state_dict": tokenizer.state_dict()}, ckpt_path)
-    print(f"Saved checkpoint to {ckpt_path}")
+        if epoch % save_every == 0 or epoch == epochs:
+            ckpt_path = output_dir / f"{checkpoint_prefix}_epoch{epoch:04d}.pth"
+            save_checkpoint(ckpt_path, tokenizer, optimizer, epoch)
+            print(f"Saved checkpoint: {ckpt_path}")
 
     if export_wav is not None:
         tokenizer.eval()
@@ -129,6 +157,14 @@ def parse_args():
         default=Path("data/tokenizer/recon_sample.wav"),
         help="Optional path to save a reconstructed sample",
     )
+    parser.add_argument("--resume-from", type=Path, default=None, help="Checkpoint to resume training from")
+    parser.add_argument("--save-every", type=int, default=50, help="Save checkpoint every N epochs")
+    parser.add_argument(
+        "--checkpoint-prefix",
+        type=str,
+        default="speech_tokenizer_telugu",
+        help="Prefix for checkpoint filenames",
+    )
     return parser.parse_args()
 
 
@@ -143,4 +179,7 @@ if __name__ == "__main__":
         beta=args.beta,
         device=args.device,
         export_wav=args.export_wav,
+        resume_from=args.resume_from,
+        save_every=args.save_every,
+        checkpoint_prefix=args.checkpoint_prefix,
     )
