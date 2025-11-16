@@ -365,11 +365,11 @@ class StreamingProcessor:
         return None
 
     async def _process_stream_mode(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
-        if not vad_result["is_voice"]:
-            return None
-
         if self.deterministic:
             return self._process_deterministic(chunk, vad_result, t0)
+
+        if not vad_result["is_voice"]:
+            return None
 
         tokens = self._chunk_to_tokens(chunk)
         if tokens is None:
