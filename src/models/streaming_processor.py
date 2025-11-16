@@ -227,10 +227,22 @@ class StreamingProcessor:
         self.tok = speech_tokenizer
         self.device = next(model.parameters()).device
         self.chunker = Chunker(chunk_ms=chunk_size_ms, sr=sample_rate, device=self.device)
+        self.transport_sr = sample_rate
+        self.tokenizer_sr = getattr(self.tok, "sr", sample_rate)
+        self.vocoder_sr = getattr(getattr(self.tok, "vocoder", None), "sample_rate", self.tokenizer_sr)
+        self.max_stream_tokens = max_stream_tokens
+        self.max_turn_tokens = max_turn_tokens
 
         self.reply_mode = os.getenv("REPLY_MODE", reply_mode).lower()
         silence_frames = 30 if self.reply_mode == "turn" else 5
-        
+
+        self.speaker_embedding = None
+        self.speaker_gain = 1.0
+        if speaker_embedding is not None:
+            self.speaker_embedding = speaker_embedding.detach().clone().to(self.device)
+            mean_val = torch.sigmoid(self.speaker_embedding.float().mean())
+            self.speaker_gain = float(mean_val.item())
+
         # Initialize Silero VAD
         try:
             self.vad = SileroVADWrapper(
