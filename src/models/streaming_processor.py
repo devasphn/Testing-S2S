@@ -5,13 +5,16 @@ Updated: November 14, 2025
 Fix: Silero VAD sample size requirement (512 samples at 16kHz)
 """
 from collections import deque
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, TYPE_CHECKING
 import time
 import os
 import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.functional as AF
+
+if TYPE_CHECKING:
+    from .deterministic_responder import DeterministicResponder
 
 # Try to import Silero VAD
 try:
@@ -208,6 +211,38 @@ class Chunker:
             return x
         return None
 
+    def _process_deterministic(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
+        if not self.det_responder:
+            return None
+
+        if vad_result.get("is_voice"):
+            self.turn_audio.append(chunk.detach().cpu())
+            self.response_generated = False
+            return None
+
+        if vad_result.get("turn_ended") and self.turn_audio and not self.response_generated:
+            user_audio = torch.cat(self.turn_audio, dim=0)
+            self.turn_audio.clear()
+            match = self.det_responder.match(user_audio, self.transport_sr)
+            if match is None:
+                print("[WARN] Deterministic responder: no match found for latest utterance")
+                return None
+
+            ai_audio = match["ai_audio"].to(self.device)
+            ai_audio = torch.tanh(ai_audio * self.speaker_gain / 0.98) * 0.98
+            self.response_generated = True
+            self.lat_hist.append((time.time() - t0) * 1000.0)
+            print(
+                f"[DETERMINISTIC] Matched question '{match.get('id')}' "
+                f"(score={match.get('score', 0.0):.2f}) → streaming '{match.get('ai_file')}'"
+            )
+            return ai_audio
+
+        if vad_result.get("turn_ended"):
+            self.turn_audio.clear()
+
+        return None
+
 
 class StreamingProcessor:
     """
@@ -222,7 +257,8 @@ class StreamingProcessor:
                  reply_mode: str = "stream",
                  max_stream_tokens: int = 6,
                  max_turn_tokens: int = 160,
-                 speaker_embedding: Optional[torch.Tensor] = None):
+                 speaker_embedding: Optional[torch.Tensor] = None,
+                 deterministic_responder: Optional['DeterministicResponder'] = None):
         self.model = model
         self.tok = speech_tokenizer
         self.device = next(model.parameters()).device
@@ -269,8 +305,14 @@ class StreamingProcessor:
         self.lat_hist = deque(maxlen=200)
 
         self.turn_buffer = []
+        self.turn_audio: List[torch.Tensor] = []
         self.generating_response = False
         self.response_generated = False
+
+        self.det_responder = deterministic_responder
+        self.deterministic = self.det_responder is not None
+        if self.deterministic:
+            print(f"[INFO] Deterministic responder enabled with {len(self.det_responder)} QA pairs")
 
         print(f"[INFO] StreamingProcessor initialized:")
         print(f"       - REPLY_MODE: {self.reply_mode}")
@@ -351,6 +393,9 @@ class StreamingProcessor:
         if not vad_result["is_voice"]:
             return None
 
+        if self.deterministic:
+            return self._process_deterministic(chunk, vad_result, t0)
+
         tokens = self._chunk_to_tokens(chunk)
         if tokens is None:
             return None
@@ -372,6 +417,9 @@ class StreamingProcessor:
         return out_audio
 
     async def _process_turn_mode(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
+        if self.deterministic:
+            return self._process_deterministic(chunk, vad_result, t0)
+
         if self.generating_response:
             return None
         
@@ -444,6 +492,7 @@ class StreamingProcessor:
         self.ai_hist.clear()
         self.lat_hist.clear()
         self.turn_buffer.clear()
+        self.turn_audio.clear()
         self.generating_response = False
         self.response_generated = False
         self.chunker.buf = torch.empty(0, device=self.device)

@@ -300,6 +300,24 @@ curl -s https://c50prx7arirkfn-8000.proxy.runpod.net/api/stats
 REPLY_MODE=turn python src/server.py
 ```
 
+### **Latest Session – Nov 16, 2025 (RunPod GPU Pod)**
+
+```bash
+# Sync repo with upstream changes
+git pull origin main
+
+# Launch inference server (streaming mode, 24 kHz transport)
+uvicorn src.server:app --host 0.0.0.0 --port 8000
+
+# Optional gain tweak when speaker embedding sounds quiet
+export SPEAKER_GAIN=1.4
+uvicorn src.server:app --host 0.0.0.0 --port 8000
+
+# Collect stats or warmup (run from inside venv)
+curl -s http://localhost:8000/api/stats
+python scripts/smoke_test.py --input wav_files/sample_user.wav --output outputs/sample_ai.wav
+```
+
 ---
 
 ## ⚙️ **Configuration Files**

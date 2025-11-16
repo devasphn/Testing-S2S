@@ -14,8 +14,11 @@ import numpy as np
 import traceback
 import os
 
+from pathlib import Path
+
 from src.models import HybridS2SModel, SpeechTokenizer
 from src.models.streaming_processor import StreamingProcessor
+from src.models.deterministic_responder import DeterministicResponder
 from src.api_config import router as api_router
 from src.web_route import router as web_router
 
@@ -28,6 +31,10 @@ except Exception:
 
 # Get reply mode
 REPLY_MODE = os.getenv("REPLY_MODE", "stream").lower()
+DETERMINISTIC_POC = os.getenv("DETERMINISTIC_POC", "0").lower() in {"1", "true", "yes", "on"}
+DET_METADATA = os.getenv("DETERMINISTIC_METADATA", "wav_files/metadata.json")
+DET_WAV_ROOT = os.getenv("DETERMINISTIC_WAV_ROOT", "wav_files")
+DET_MIN_SCORE = float(os.getenv("DETERMINISTIC_MIN_SCORE", "0.75"))
 
 app = FastAPI(title="Testing-S2S Realtime Server", version="0.1.7")
 
@@ -45,6 +52,7 @@ app.include_router(web_router)
 _model: Optional[HybridS2SModel] = None
 _tok: Optional[SpeechTokenizer] = None
 _proc: Optional[StreamingProcessor] = None
+_det_responder: Optional[DeterministicResponder] = None
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Transport format
@@ -121,8 +129,23 @@ async def _warmup_pipeline():
 
 @app.on_event("startup")
 async def startup():
-    global _model, _tok, _proc
+    global _model, _tok, _proc, _det_responder
     print(f"[INFO] Starting server on device: {_device} with REPLY_MODE={REPLY_MODE}")
+
+    _det_responder = None
+    if DETERMINISTIC_POC:
+        try:
+            _det_responder = DeterministicResponder(
+                metadata_path=Path(DET_METADATA),
+                wav_root=Path(DET_WAV_ROOT),
+                transport_sr=TRANSPORT_SR,
+                min_score=DET_MIN_SCORE,
+            )
+            print("[INFO] Deterministic POC mode enabled - streaming prerecorded Telugu replies")
+        except Exception as exc:
+            print(f"[ERROR] Failed to initialize DeterministicResponder: {exc}")
+            raise
+
     _tok = SpeechTokenizer().to(_device)
     _load_state_dict(_tok, TOKENIZER_CKPT)
     _model = HybridS2SModel().to(_device)
@@ -137,10 +160,12 @@ async def startup():
         max_latency_ms=200,
         vad_threshold=0.65,  # FIXED: Changed from 0.001 to 0.65 to prevent always-on audio
         reply_mode=REPLY_MODE,
-        speaker_embedding=speaker_embedding
+        speaker_embedding=speaker_embedding,
+        deterministic_responder=_det_responder,
     )
     # Warmup once to reduce first-turn latency/plan selection
-    await _warmup_pipeline()
+    if _proc and not _proc.deterministic:
+        await _warmup_pipeline()
     print(f"[INFO] Server startup complete - WebSocket endpoint ready at /ws/stream (mode: {REPLY_MODE})")
 
 @app.get("/health")
