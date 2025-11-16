@@ -139,11 +139,20 @@ class HybridS2SModel(nn.Module):
         return self.unified(input_ids=input_ids, modality_ids=modality)
 
     @torch.no_grad()
-    def generate_streaming(self, user_audio_chunk_ids: torch.Tensor, max_new_tokens: int = 6, temperature: float = 0.9) -> torch.Tensor:
+    def generate_streaming(
+        self,
+        user_audio_chunk_ids: torch.Tensor,
+        ai_context: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 6,
+        temperature: float = 0.9,
+    ) -> torch.Tensor:
         device = user_audio_chunk_ids.device
         with inference_mode(device):
             b = user_audio_chunk_ids.size(0)
-            ai_ids = torch.zeros(b, 3, device=device, dtype=torch.long)  # smaller context
+            if ai_context is not None and ai_context.numel() > 0:
+                ai_ids = ai_context[:, -3:].to(device)
+            else:
+                ai_ids = torch.zeros(b, 3, device=device, dtype=torch.long)  # smaller context
             gen = []
             for _ in range(max_new_tokens):
                 out = self.forward(user_audio_chunk_ids, ai_ids)
