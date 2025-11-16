@@ -126,4 +126,3 @@ class DeterministicResponder:
         match = self.entries[int(best_idx)].copy()
         match["score"] = float(best_score.item())
         return match
-*** End Patch (Creation)
