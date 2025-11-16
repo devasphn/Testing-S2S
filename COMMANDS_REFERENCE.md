@@ -316,6 +316,14 @@ uvicorn src.server:app --host 0.0.0.0 --port 8000
 # Collect stats or warmup (run from inside venv)
 curl -s http://localhost:8000/api/stats
 python scripts/smoke_test.py --input wav_files/sample_user.wav --output outputs/sample_ai.wav
+
+# Deterministic Telugu POC (play prerecorded replies)
+export DETERMINISTIC_POC=1
+# optional overrides:
+# export DETERMINISTIC_METADATA=wav_files/metadata.json
+# export DETERMINISTIC_WAV_ROOT=wav_files
+# export DETERMINISTIC_MIN_SCORE=0.8
+uvicorn src.server:app --host 0.0.0.0 --port 8000
 ```
 
 ---

@@ -211,39 +211,6 @@ class Chunker:
             return x
         return None
 
-    def _process_deterministic(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
-        if not self.det_responder:
-            return None
-
-        if vad_result.get("is_voice"):
-            self.turn_audio.append(chunk.detach().cpu())
-            self.response_generated = False
-            return None
-
-        if vad_result.get("turn_ended") and self.turn_audio and not self.response_generated:
-            user_audio = torch.cat(self.turn_audio, dim=0)
-            self.turn_audio.clear()
-            match = self.det_responder.match(user_audio, self.transport_sr)
-            if match is None:
-                print("[WARN] Deterministic responder: no match found for latest utterance")
-                return None
-
-            ai_audio = match["ai_audio"].to(self.device)
-            ai_audio = torch.tanh(ai_audio * self.speaker_gain / 0.98) * 0.98
-            self.response_generated = True
-            self.lat_hist.append((time.time() - t0) * 1000.0)
-            print(
-                f"[DETERMINISTIC] Matched question '{match.get('id')}' "
-                f"(score={match.get('score', 0.0):.2f}) → streaming '{match.get('ai_file')}'"
-            )
-            return ai_audio
-
-        if vad_result.get("turn_ended"):
-            self.turn_audio.clear()
-
-        return None
-
-
 class StreamingProcessor:
     """
     Production streaming processor with Silero VAD
@@ -459,6 +426,38 @@ class StreamingProcessor:
                 self.turn_buffer.clear()
                 self.response_generated = True
                 self.generating_response = False
+
+        return None
+
+    def _process_deterministic(self, chunk: torch.Tensor, vad_result: Dict[str, bool], t0: float) -> Optional[torch.Tensor]:
+        if not self.det_responder:
+            return None
+
+        if vad_result.get("is_voice"):
+            self.turn_audio.append(chunk.detach().cpu())
+            self.response_generated = False
+            return None
+
+        if vad_result.get("turn_ended") and self.turn_audio and not self.response_generated:
+            user_audio = torch.cat(self.turn_audio, dim=0)
+            self.turn_audio.clear()
+            match = self.det_responder.match(user_audio, self.transport_sr)
+            if match is None:
+                print("[WARN] Deterministic responder: no match found for latest utterance")
+                return None
+
+            ai_audio = match["ai_audio"].to(self.device)
+            ai_audio = torch.tanh(ai_audio * self.speaker_gain / 0.98) * 0.98
+            self.response_generated = True
+            self.lat_hist.append((time.time() - t0) * 1000.0)
+            print(
+                f"[DETERMINISTIC] Matched question '{match.get('id')}' "
+                f"(score={match.get('score', 0.0):.2f}) → streaming '{match.get('ai_file')}'"
+            )
+            return ai_audio
+
+        if vad_result.get("turn_ended"):
+            self.turn_audio.clear()
 
         return None
 
