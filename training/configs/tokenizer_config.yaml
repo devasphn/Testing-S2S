@@ -1,0 +1,50 @@
+# Speech Tokenizer Training Configuration
+# Training budget: ~$300 (250 GPU hours on RunPod A100)
+
+model:
+  n_mels: 80
+  sample_rate: 24000  # Match Luna AI
+  hop_ms: 20  # 50 Hz frame rate
+  codebook_size: 1024
+  hidden_dim: 512
+  num_quantizers: 8  # RVQ depth
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+
+data:
+  data_dir: "/workspace/data"  # Change to your data directory
+  train_split: "train-clean-100"  # LibriSpeech split
+  val_ratio: 0.05  # 5% validation
+  duration: 3.0  # seconds per sample
+  max_files: null  # null = use all files
+
+training:
+  epochs: 100
+  batch_size: 16  # Adjust based on GPU memory
+  learning_rate: 1e-4
+  min_lr: 1e-6
+  weight_decay: 0.01
+  grad_clip: 1.0
+  commitment_weight: 0.25  # VQ-VAE commitment loss weight
+  
+  num_workers: 4  # DataLoader workers
+  save_every: 10  # Save checkpoint every N epochs
+  
+  checkpoint_dir: "./checkpoints/tokenizer"
+
+logging:
+  use_wandb: true  # Set to false if not using wandb
+  project: "luna-speech-tokenizer"
+  run_name: "tokenizer_v1"
+
+# Expected training time:
+# - LibriSpeech train-clean-100: ~28,000 utterances
+# - Batch size 16, 3s samples
+# - ~1,750 batches/epoch
+# - ~5 minutes/epoch on A100
+# - Total: 100 epochs x 5 min = 500 minutes = 8.3 hours
+# - Cost: 8.3 hours x $1.19/hr = ~$10 (MUCH cheaper than expected!)
+#
+# Note: This is for 100 hours of data. For production quality:
+# - Use LibriSpeech train-clean-360 + train-other-500 (860 hours total)
+# - Expected training: 200-300 GPU hours = $238-357
