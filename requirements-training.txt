@@ -1,0 +1,38 @@
+# Additional dependencies for training Luna-style speech-to-speech models
+# Install after requirements.txt: pip install -r requirements-training.txt
+
+# Training frameworks
+accelerate==0.34.2
+wandb==0.18.3
+tensorboard==2.14.0
+
+# Dataset handling
+datasets==3.0.1
+pandas==2.2.2
+tqdm==4.66.5
+
+# Audio augmentation
+audiomentations==0.36.0
+pedalboard==0.9.9
+
+# Vector quantization
+vector-quantize-pytorch==1.14.24
+
+# Distributed training
+torch-distributed==0.3.0
+
+# Model optimization
+bitsandbytes==0.43.3
+flash-attn==2.6.3; sys_platform == 'linux'
+
+# Checkpoint management
+safetensors==0.4.5
+
+# Evaluation metrics
+pesq==0.0.4
+pystoi==0.4.1
+jiwer==3.0.4
+
+# Data preprocessing
+sox==1.5.0
+pydub==0.25.1
